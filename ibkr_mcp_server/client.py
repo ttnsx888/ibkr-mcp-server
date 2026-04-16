@@ -5,7 +5,7 @@ import logging
 from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, util
+from ib_async import IB, Stock, LimitOrder, util
 from .config import settings
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
@@ -78,7 +78,7 @@ class IBKRClient:
             # Setup event handlers
             self.ib.disconnectedEvent += self._on_disconnect
             self.ib.errorEvent += self._on_error
-            
+
             # Wait for connection to stabilize
             await asyncio.sleep(2)
             
@@ -339,6 +339,177 @@ class IBKRClient:
             self.logger.error(f"Error getting accounts: {e}")
             return {"error": str(e)}
     
+    @rate_limit(calls_per_second=1.0)
+    async def get_quote(self, symbol: str) -> Dict:
+        """Quote for a symbol (last, bid, ask, close).
+
+        Tries live/delayed streaming first. Falls back to historical daily
+        bars for paper accounts that lack streaming market data subscription
+        (common case — emits error 10089).
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        contract = Stock(symbol.upper(), 'SMART', 'USD')
+        qualified = await self.ib.reqContractDetailsAsync(contract)
+        if not qualified:
+            return {"symbol": symbol, "error": "Contract not found"}
+        qualified_contract = qualified[0].contract
+
+        def _valid(v):
+            return v is not None and not (isinstance(v, float) and v != v) and v > 0
+
+        # Try live streaming first (mode 1 = default, live).
+        async def _stream(mode_label: str) -> tuple:
+            ticker = self.ib.reqMktData(qualified_contract, '', False, False)
+            for _ in range(6):
+                await asyncio.sleep(0.5)
+                if any(_valid(v) for v in (ticker.last, ticker.close, ticker.bid, ticker.ask)):
+                    break
+            try:
+                self.ib.cancelMktData(qualified_contract)
+            except Exception:
+                pass
+            return (
+                safe_float(ticker.last) if _valid(ticker.last) else 0.0,
+                safe_float(ticker.bid) if _valid(ticker.bid) else 0.0,
+                safe_float(ticker.ask) if _valid(ticker.ask) else 0.0,
+                safe_float(ticker.close) if _valid(ticker.close) else 0.0,
+                mode_label,
+            )
+
+        try:
+            self.ib.reqMarketDataType(1)  # live
+        except Exception:
+            pass
+        last, bid, ask, close, source = await _stream("live")
+
+        # If live returned nothing (no subscription or 10089), try delayed.
+        if not any((last, bid, ask, close)):
+            try:
+                self.ib.reqMarketDataType(3)  # delayed
+            except Exception:
+                pass
+            last, bid, ask, close, source = await _stream("delayed")
+
+        # Fallback: historical daily bars — works on paper without subscription.
+        if not any((last, bid, ask, close)):
+            try:
+                bars = await self.ib.reqHistoricalDataAsync(
+                    qualified_contract,
+                    endDateTime='',
+                    durationStr='2 D',
+                    barSizeSetting='1 day',
+                    whatToShow='TRADES',
+                    useRTH=True,
+                    formatDate=1,
+                )
+                if bars:
+                    last_bar = bars[-1]
+                    last = safe_float(last_bar.close)
+                    close = safe_float(last_bar.close)
+                    source = f"historical (bar {last_bar.date})"
+            except Exception as e:
+                self.logger.warning(f"Historical fallback failed for {symbol}: {e}")
+
+        return {
+            "symbol": symbol.upper(),
+            "last": last,
+            "bid": bid,
+            "ask": ask,
+            "close": close,
+            "contract_id": qualified_contract.conId,
+            "source": source,
+        }
+
+    @rate_limit(calls_per_second=0.5)
+    async def place_limit_order(self, symbol: str, action: str, quantity: int,
+                                limit_price: float, tif: str = "DAY",
+                                outside_rth: bool = False,
+                                account: Optional[str] = None) -> Dict:
+        """Submit a limit order to IBKR. Does NOT stage — sends immediately."""
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        action = action.upper()
+        if action not in ("BUY", "SELL"):
+            raise ValidationError(f"Invalid action: {action}")
+
+        contract = Stock(symbol.upper(), 'SMART', 'USD')
+        qualified = await self.ib.qualifyContractsAsync(contract)
+        if not qualified or not contract.conId:
+            raise ValidationError(f"Could not qualify contract for {symbol}")
+
+        order = LimitOrder(
+            action=action,
+            totalQuantity=int(quantity),
+            lmtPrice=float(limit_price),
+            tif=tif.upper(),
+            outsideRth=bool(outside_rth),
+        )
+        if account or self.current_account:
+            order.account = account or self.current_account
+
+        trade = self.ib.placeOrder(contract, order)
+        await asyncio.sleep(1.0)  # let IBKR echo initial status
+
+        return {
+            "order_id": trade.order.orderId,
+            "perm_id": trade.order.permId,
+            "symbol": symbol.upper(),
+            "action": action,
+            "quantity": int(quantity),
+            "limit_price": float(limit_price),
+            "tif": tif.upper(),
+            "status": trade.orderStatus.status,
+            "filled": safe_float(trade.orderStatus.filled),
+            "remaining": safe_float(trade.orderStatus.remaining),
+            "account": order.account,
+        }
+
+    @rate_limit(calls_per_second=1.0)
+    async def get_open_trades(self) -> List[Dict]:
+        """Return all currently-open trades."""
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        trades = self.ib.openTrades()
+        out = []
+        for t in trades:
+            out.append({
+                "order_id": t.order.orderId,
+                "perm_id": t.order.permId,
+                "symbol": t.contract.symbol,
+                "action": t.order.action,
+                "quantity": safe_float(t.order.totalQuantity),
+                "limit_price": safe_float(getattr(t.order, "lmtPrice", 0)),
+                "order_type": t.order.orderType,
+                "tif": t.order.tif,
+                "status": t.orderStatus.status,
+                "filled": safe_float(t.orderStatus.filled),
+                "remaining": safe_float(t.orderStatus.remaining),
+                "account": t.order.account,
+            })
+        return out
+
+    @rate_limit(calls_per_second=1.0)
+    async def cancel_order(self, order_id: int) -> Dict:
+        """Cancel a live order by its IBKR orderId."""
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        for trade in self.ib.trades():
+            if trade.order.orderId == int(order_id):
+                self.ib.cancelOrder(trade.order)
+                await asyncio.sleep(0.5)
+                return {
+                    "order_id": order_id,
+                    "symbol": trade.contract.symbol,
+                    "status": trade.orderStatus.status,
+                    "cancelled": True,
+                }
+        return {"order_id": order_id, "cancelled": False, "error": "Order not found"}
+
     def _serialize_position(self, position) -> Dict:
         """Convert Position to serializable dict."""
         return {

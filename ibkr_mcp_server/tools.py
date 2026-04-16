@@ -6,8 +6,68 @@ from typing import Any, Sequence
 from mcp.server import Server
 from mcp.types import Tool, TextContent, CallToolRequest
 
+from dataclasses import asdict
+
 from .client import ibkr_client
-from .utils import validate_symbols, IBKRError
+from .config import settings
+from .orders import StagedOrder, staged_store
+from .utils import validate_symbol, validate_symbols, IBKRError
+
+
+LIVE_PORTS = {7496, 4001}
+MAX_QUOTE_DRIFT = 0.20  # reject staging/confirming if limit is >20% away from last
+
+
+async def _validate_order_inputs(symbol: str, action: str, quantity: int,
+                                 limit_price: float,
+                                 require_quote: bool = True) -> dict:
+    """Shared validation. Returns {'ok': True} or {'ok': False, 'error': ...}.
+
+    When require_quote=False (used by stage_order), skips the quote-drift check
+    if IBKR is not connected — allows offline staging. confirm_order always
+    passes require_quote=True so the drift check runs at submission time.
+    """
+    action = action.upper()
+    if action not in ("BUY", "SELL"):
+        return {"ok": False, "error": f"action must be BUY or SELL (got {action!r})"}
+    if quantity <= 0:
+        return {"ok": False, "error": "quantity must be positive"}
+    if quantity > settings.max_order_size:
+        return {"ok": False,
+                "error": f"quantity {quantity} exceeds MAX_ORDER_SIZE ({settings.max_order_size})"}
+    if limit_price <= 0:
+        return {"ok": False, "error": "limit_price must be positive"}
+
+    # Quote sanity — reject tier prices wildly off from last.
+    try:
+        quote = await ibkr_client.get_quote(symbol)
+    except Exception:
+        if require_quote:
+            return {"ok": False, "error": "IBKR not connected — cannot validate quote"}
+        return {"ok": True, "reference_price": None, "drift_pct": None,
+                "warning": "IBKR offline — quote-drift check skipped, will re-validate at confirm time"}
+
+    if "error" in quote:
+        if require_quote:
+            return {"ok": False, "error": f"quote lookup failed: {quote['error']}"}
+        return {"ok": True, "reference_price": None, "drift_pct": None,
+                "warning": f"quote lookup failed ({quote['error']}) — will re-validate at confirm time"}
+
+    ref = quote.get("last") or quote.get("close") or 0
+    if ref <= 0:
+        if require_quote:
+            return {"ok": False, "error": "could not obtain reference price for symbol"}
+        return {"ok": True, "reference_price": None, "drift_pct": None,
+                "warning": "no reference price available — will re-validate at confirm time"}
+
+    drift = abs(limit_price - ref) / ref
+    source = quote.get("source", "unknown")
+    if drift > MAX_QUOTE_DRIFT:
+        return {"ok": False,
+                "error": f"limit ${limit_price:.2f} is {drift*100:.1f}% from last ${ref:.2f} "
+                         f"(max {MAX_QUOTE_DRIFT*100:.0f}%, source={source}). Refusing."}
+    return {"ok": True, "reference_price": ref, "drift_pct": round(drift * 100, 2),
+            "reference_source": source}
 
 
 # Create the server instance
@@ -98,6 +158,82 @@ TOOLS = [
         name="get_connection_status",
         description="Check IBKR TWS/Gateway connection status and account information",
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+    ),
+    Tool(
+        name="stage_order",
+        description=("Validate and stage a limit order for later approval. Does NOT submit to IBKR. "
+                     "Applies MAX_ORDER_SIZE and quote-drift safety gates. Returns a staged_id for confirm_order."),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "action": {"type": "string", "enum": ["BUY", "SELL"]},
+                "quantity": {"type": "integer", "minimum": 1},
+                "limit_price": {"type": "number", "exclusiveMinimum": 0},
+                "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "DAY"},
+                "source": {"type": "string", "description": "Provenance tag, e.g. 'scan 2026-04-15 AMD T1'"}
+            },
+            "required": ["symbol", "action", "quantity", "limit_price"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="list_staged_orders",
+        description="List all staged (not yet submitted) orders. Optionally filter by symbol or source prefix.",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string"},
+                "source_prefix": {"type": "string"}
+            },
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="confirm_order",
+        description=("Submit a staged order to IBKR. Re-validates safety gates. "
+                     "Refused on live-trading port if ENABLE_LIVE_TRADING=false."),
+        inputSchema={
+            "type": "object",
+            "properties": {"staged_id": {"type": "string"}},
+            "required": ["staged_id"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="cancel_staged_order",
+        description="Remove a staged order without submitting it.",
+        inputSchema={
+            "type": "object",
+            "properties": {"staged_id": {"type": "string"}},
+            "required": ["staged_id"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="get_live_orders",
+        description="List all currently-open orders on the IBKR account.",
+        inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+    ),
+    Tool(
+        name="cancel_live_order",
+        description="Cancel a live IBKR order by its orderId.",
+        inputSchema={
+            "type": "object",
+            "properties": {"order_id": {"type": "integer"}},
+            "required": ["order_id"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="get_market_quote",
+        description="Snapshot quote (last, bid, ask, close) for a symbol.",
+        inputSchema={
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False
+        }
     )
 ]
 
@@ -206,6 +342,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 )]
                 
         elif name == "get_connection_status":
+            # Actively probe — don't return stale cached state.
+            try:
+                await ibkr_client._ensure_connected()
+            except Exception:
+                pass
             status = {
                 "connected": ibkr_client.is_connected(),
                 "host": ibkr_client.host,
@@ -220,6 +361,106 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 text=json.dumps(status, indent=2)
             )]
         
+        elif name == "stage_order":
+            symbol = validate_symbol(arguments["symbol"])
+            action = arguments["action"]
+            quantity = int(arguments["quantity"])
+            limit_price = float(arguments["limit_price"])
+            tif = arguments.get("tif", "DAY")
+            source = arguments.get("source", "")
+
+            v = await _validate_order_inputs(symbol, action, quantity, limit_price,
+                                               require_quote=False)
+            if not v["ok"]:
+                return [TextContent(type="text", text=json.dumps({"staged": False, "error": v["error"]}))]
+
+            order = StagedOrder.new(symbol, action, quantity, limit_price, tif=tif, source=source)
+            staged_store.add(order)
+            return [TextContent(type="text", text=json.dumps({
+                "staged": True,
+                "staged_id": order.id,
+                "summary": order.summary(),
+                "reference_price": v["reference_price"],
+                "drift_pct": v["drift_pct"],
+                "reference_source": v.get("reference_source"),
+            }, indent=2))]
+
+        elif name == "list_staged_orders":
+            orders = staged_store.list(
+                symbol=arguments.get("symbol"),
+                source_prefix=arguments.get("source_prefix"),
+            )
+            return [TextContent(type="text",
+                                text=json.dumps([asdict(o) for o in orders], indent=2))]
+
+        elif name == "confirm_order":
+            staged_id = arguments["staged_id"]
+            order = staged_store.get(staged_id)
+            if not order:
+                return [TextContent(type="text",
+                                    text=json.dumps({"submitted": False,
+                                                     "error": f"No staged order with id {staged_id}"}))]
+            if order.is_expired():
+                staged_store.remove(staged_id)
+                return [TextContent(type="text",
+                                    text=json.dumps({"submitted": False,
+                                                     "error": "Staged order expired (>7d old). Re-stage."}))]
+
+            # Live-trading gate.
+            if ibkr_client.port in LIVE_PORTS and not settings.enable_live_trading:
+                return [TextContent(type="text", text=json.dumps({
+                    "submitted": False,
+                    "error": (f"Live port {ibkr_client.port} detected but ENABLE_LIVE_TRADING=false. "
+                              "Refusing to submit. Set ENABLE_LIVE_TRADING=true in .env to allow."),
+                }))]
+
+            # Re-validate against current market (strict — IBKR must be connected)
+            v = await _validate_order_inputs(order.symbol, order.action,
+                                             order.quantity, order.limit_price,
+                                             require_quote=True)
+            if not v["ok"]:
+                return [TextContent(type="text",
+                                    text=json.dumps({"submitted": False, "error": v["error"]}))]
+
+            try:
+                result = await ibkr_client.place_limit_order(
+                    symbol=order.symbol, action=order.action,
+                    quantity=order.quantity, limit_price=order.limit_price,
+                    tif=order.tif,
+                )
+            except Exception as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"submitted": False,
+                                                     "error": f"IBKR rejected order: {e}"}))]
+
+            staged_store.remove(staged_id)
+            return [TextContent(type="text", text=json.dumps({
+                "submitted": True,
+                "staged_id": staged_id,
+                "reference_price": v["reference_price"],
+                "drift_pct": v["drift_pct"],
+                "reference_source": v.get("reference_source"),
+                "ibkr": result,
+            }, indent=2))]
+
+        elif name == "cancel_staged_order":
+            staged_id = arguments["staged_id"]
+            removed = staged_store.remove(staged_id)
+            return [TextContent(type="text",
+                                text=json.dumps({"cancelled": removed, "staged_id": staged_id}))]
+
+        elif name == "get_live_orders":
+            trades = await ibkr_client.get_open_trades()
+            return [TextContent(type="text", text=json.dumps(trades, indent=2))]
+
+        elif name == "cancel_live_order":
+            result = await ibkr_client.cancel_order(int(arguments["order_id"]))
+            return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+        elif name == "get_market_quote":
+            quote = await ibkr_client.get_quote(validate_symbol(arguments["symbol"]))
+            return [TextContent(type="text", text=json.dumps(quote, indent=2))]
+
         else:
             return [TextContent(
                 type="text",
