@@ -55,3 +55,6 @@ Thumbs.db
 *.TWS
 *.xml
 *.out
+
+# Local runtime state
+.staged_orders.json
