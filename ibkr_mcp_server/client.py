@@ -173,9 +173,13 @@ class IBKRClient:
                 'PreviousDayEquityWithLoanValue', 'FullInitMarginReq', 'FullMaintMarginReq'
             ]
             
-            account_values = await self.ib.reqAccountSummaryAsync(account, ','.join(summary_tags))
-            
-            return [self._serialize_account_value(av) for av in account_values]
+            # New ib_async API: accountSummaryAsync() handles the underlying
+            # reqAccountSummaryAsync() call and returns the filtered values.
+            # Calling the sync accountSummary() deadlocks inside a running loop.
+            acct = account if account and account != "All" else ""
+            account_values = await self.ib.accountSummaryAsync(acct)
+            filtered = [av for av in account_values if av.tag in summary_tags]
+            return [self._serialize_account_value(av) for av in filtered]
             
         except Exception as e:
             self.logger.error(f"Account summary request failed: {e}")
