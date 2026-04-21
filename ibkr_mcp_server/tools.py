@@ -171,6 +171,8 @@ TOOLS = [
                 "quantity": {"type": "integer", "minimum": 1},
                 "limit_price": {"type": "number", "exclusiveMinimum": 0},
                 "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "DAY"},
+                "outside_rth": {"type": "boolean", "default": False,
+                                 "description": "Allow order to trigger/fill outside regular trading hours"},
                 "source": {"type": "string", "description": "Provenance tag, e.g. 'scan 2026-04-15 AMD T1'"}
             },
             "required": ["symbol", "action", "quantity", "limit_price"],
@@ -214,6 +216,23 @@ TOOLS = [
         name="get_live_orders",
         description="List all currently-open orders on the IBKR account.",
         inputSchema={"type": "object", "properties": {}, "additionalProperties": False}
+    ),
+    Tool(
+        name="get_todays_fills",
+        description=(
+            "List today's executed fills from TWS's execution log. Reliable "
+            "across reconnects within the trading day — unlike get_live_orders, "
+            "which drops fully-reconciled entries. Use this in post-hoc reports "
+            "(e.g. evening scan 'Today's Filled Orders' section) where fills "
+            "may have rolled off the live-orders window. Pass an optional "
+            "`account` to filter; otherwise returns fills for all accounts on "
+            "the connection."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"account": {"type": "string"}},
+            "additionalProperties": False
+        }
     ),
     Tool(
         name="cancel_live_order",
@@ -367,6 +386,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             quantity = int(arguments["quantity"])
             limit_price = float(arguments["limit_price"])
             tif = arguments.get("tif", "DAY")
+            outside_rth = bool(arguments.get("outside_rth", False))
             source = arguments.get("source", "")
 
             v = await _validate_order_inputs(symbol, action, quantity, limit_price,
@@ -374,7 +394,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             if not v["ok"]:
                 return [TextContent(type="text", text=json.dumps({"staged": False, "error": v["error"]}))]
 
-            order = StagedOrder.new(symbol, action, quantity, limit_price, tif=tif, source=source)
+            order = StagedOrder.new(symbol, action, quantity, limit_price,
+                                    tif=tif, source=source, outside_rth=outside_rth)
             staged_store.add(order)
             return [TextContent(type="text", text=json.dumps({
                 "staged": True,
@@ -427,6 +448,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     symbol=order.symbol, action=order.action,
                     quantity=order.quantity, limit_price=order.limit_price,
                     tif=order.tif,
+                    outside_rth=order.outside_rth,
                 )
             except Exception as e:
                 return [TextContent(type="text",
@@ -452,6 +474,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         elif name == "get_live_orders":
             trades = await ibkr_client.get_open_trades()
             return [TextContent(type="text", text=json.dumps(trades, indent=2))]
+
+        elif name == "get_todays_fills":
+            account = arguments.get("account")
+            fills = await ibkr_client.get_todays_fills(account)
+            return [TextContent(type="text", text=json.dumps(fills, indent=2))]
 
         elif name == "cancel_live_order":
             result = await ibkr_client.cancel_order(int(arguments["order_id"]))

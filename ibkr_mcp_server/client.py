@@ -5,7 +5,7 @@ import logging
 from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, LimitOrder, util
+from ib_async import IB, Stock, LimitOrder, ExecutionFilter, util
 from .config import settings
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
@@ -465,6 +465,7 @@ class IBKRClient:
             "quantity": int(quantity),
             "limit_price": float(limit_price),
             "tif": tif.upper(),
+            "outside_rth": bool(outside_rth),
             "status": trade.orderStatus.status,
             "filled": safe_float(trade.orderStatus.filled),
             "remaining": safe_float(trade.orderStatus.remaining),
@@ -489,6 +490,7 @@ class IBKRClient:
                 "limit_price": safe_float(getattr(t.order, "lmtPrice", 0)),
                 "order_type": t.order.orderType,
                 "tif": t.order.tif,
+                "outside_rth": bool(getattr(t.order, "outsideRth", False)),
                 "status": t.orderStatus.status,
                 "filled": safe_float(t.orderStatus.filled),
                 "remaining": safe_float(t.orderStatus.remaining),
@@ -513,6 +515,64 @@ class IBKRClient:
                     "cancelled": True,
                 }
         return {"order_id": order_id, "cancelled": False, "error": "Order not found"}
+
+    @rate_limit(calls_per_second=1.0)
+    async def get_todays_fills(self, account: Optional[str] = None) -> List[Dict]:
+        """Return today's executed fills from TWS.
+
+        Uses ib.reqExecutionsAsync() which queries TWS's execution history for the
+        current trading day. More reliable than filtering get_open_trades() by
+        status=="Filled" — those entries roll off the live-orders window once fully
+        reconciled, so any post-hoc scan (e.g. evening fund-manager run) can't see
+        them. reqExecutions pulls straight from TWS's own day-log and survives
+        reconnects within the same trading day.
+
+        Args:
+            account: optional account filter. If None, returns fills for all
+                     accounts visible on this connection.
+
+        Returns a list of dicts with fields aligned to the scan report's
+        `filled_orders[]` schema. `source` is NOT populated here (executions don't
+        carry the caller's scan/tier tag); callers enrich by joining on `order_id`
+        against their own `submitted_orders[]` record if they need it.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        # Empty ExecutionFilter → today's executions, all accounts on the connection.
+        filt = ExecutionFilter()
+        if account:
+            filt.acctCode = account
+
+        fills = await self.ib.reqExecutionsAsync(filt)
+
+        out = []
+        for f in fills:
+            execution = f.execution
+            contract = f.contract
+            comm = f.commissionReport
+
+            # Map IBKR side codes ("BOT"/"SLD") to the action verbs the scan
+            # report uses so downstream consumers don't need to translate.
+            side = execution.side
+            action = "BUY" if side == "BOT" else "SELL" if side == "SLD" else side
+
+            out.append({
+                "order_id": execution.orderId,
+                "perm_id": execution.permId,
+                "exec_id": execution.execId,
+                "symbol": contract.symbol,
+                "action": action,
+                "quantity": safe_float(execution.shares),
+                "fill_price": safe_float(execution.price),
+                "avg_price": safe_float(getattr(execution, "avgPrice", 0)) or safe_float(execution.price),
+                "time": execution.time.isoformat() if execution.time else None,
+                "commission": safe_float(getattr(comm, "commission", 0)),
+                "commission_currency": getattr(comm, "currency", ""),
+                "account": execution.acctNumber,
+                "exchange": execution.exchange,
+            })
+        return out
 
     def _serialize_position(self, position) -> Dict:
         """Convert Position to serializable dict."""
