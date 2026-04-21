@@ -32,10 +32,12 @@ class StagedOrder:
     source: str
     created_at: str          # ISO 8601
     expires_at: str          # ISO 8601
+    outside_rth: bool = False
 
     @classmethod
     def new(cls, symbol: str, action: str, quantity: int, limit_price: float,
-            tif: str = "DAY", source: str = "") -> "StagedOrder":
+            tif: str = "DAY", source: str = "",
+            outside_rth: bool = False) -> "StagedOrder":
         now = datetime.utcnow()
         return cls(
             id=str(uuid.uuid4())[:8],
@@ -47,14 +49,16 @@ class StagedOrder:
             source=source,
             created_at=now.isoformat(timespec="seconds"),
             expires_at=(now + timedelta(days=STAGED_TTL_DAYS)).isoformat(timespec="seconds"),
+            outside_rth=bool(outside_rth),
         )
 
     def is_expired(self) -> bool:
         return datetime.fromisoformat(self.expires_at) < datetime.utcnow()
 
     def summary(self) -> str:
+        rth = " outsideRTH" if self.outside_rth else ""
         return (f"{self.action} {self.quantity} {self.symbol} "
-                f"@ ${self.limit_price:.2f} ({self.tif}) — {self.source}")
+                f"@ ${self.limit_price:.2f} ({self.tif}{rth}) — {self.source}")
 
 
 class StagedOrderStore:
