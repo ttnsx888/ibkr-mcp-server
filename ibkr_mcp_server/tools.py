@@ -15,7 +15,9 @@ from .utils import validate_symbol, validate_symbols, IBKRError
 
 
 LIVE_PORTS = {7496, 4001}
-MAX_QUOTE_DRIFT = 0.20  # reject staging/confirming if limit is >20% away from last
+MAX_QUOTE_DRIFT = 0.30  # reject staging/confirming if limit is >30% away from last
+                        # MUST match MAX_SUBMIT_DRIFT_PCT in /Users/ttang/Trader/scripts/compute_signals.py
+                        # so the scanner pre-filter and this server-side gate agree.
 
 
 async def _validate_order_inputs(symbol: str, action: str, quantity: int,
