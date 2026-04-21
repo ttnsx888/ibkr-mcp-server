@@ -1,6 +1,7 @@
 """MCP tools for IBKR functionality."""
 
 import json
+import time
 from typing import Any, Sequence
 
 from mcp.server import Server
@@ -18,6 +19,34 @@ LIVE_PORTS = {7496, 4001}
 MAX_QUOTE_DRIFT = 0.30  # reject staging/confirming if limit is >30% away from last
                         # MUST match MAX_SUBMIT_DRIFT_PCT in /Users/ttang/Trader/scripts/compute_signals.py
                         # so the scanner pre-filter and this server-side gate agree.
+
+# Per-symbol quote cache shared by stage_order / confirm_order validation.
+# During a scan, a single symbol's tiers (T1/T2/T3) all validate against the
+# same reference price — and confirm_order fires seconds after stage_order.
+# Without this, each validation pays ~3s in reqMktData poll + 1s rate limit.
+# TTL is short enough that a price move large enough to matter (>30% drift)
+# can't hide inside the cache window.
+_QUOTE_CACHE: dict[str, tuple[float, dict]] = {}
+_QUOTE_CACHE_TTL = 30.0  # seconds
+
+
+async def _cached_get_quote(symbol: str) -> dict:
+    """Return a recent quote for symbol, reusing a cached one if <TTL old.
+
+    Only caches successful lookups — error responses always re-fetch so a
+    transient IBKR hiccup doesn't poison the cache for 30s.
+    """
+    key = symbol.upper()
+    now = time.monotonic()
+    entry = _QUOTE_CACHE.get(key)
+    if entry is not None:
+        fetched_at, cached = entry
+        if now - fetched_at < _QUOTE_CACHE_TTL:
+            return cached
+    quote = await ibkr_client.get_quote(symbol)
+    if "error" not in quote:
+        _QUOTE_CACHE[key] = (now, quote)
+    return quote
 
 
 async def _validate_order_inputs(symbol: str, action: str, quantity: int,
@@ -41,8 +70,10 @@ async def _validate_order_inputs(symbol: str, action: str, quantity: int,
         return {"ok": False, "error": "limit_price must be positive"}
 
     # Quote sanity — reject tier prices wildly off from last.
+    # Uses a short-TTL per-symbol cache so multi-tier stage_order + confirm_order
+    # sequences don't each pay the full reqMktData poll cost.
     try:
-        quote = await ibkr_client.get_quote(symbol)
+        quote = await _cached_get_quote(symbol)
     except Exception:
         if require_quote:
             return {"ok": False, "error": "IBKR not connected — cannot validate quote"}
@@ -56,6 +87,15 @@ async def _validate_order_inputs(symbol: str, action: str, quantity: int,
                 "warning": f"quote lookup failed ({quote['error']}) — will re-validate at confirm time"}
 
     ref = quote.get("last") or quote.get("close") or 0
+    source = quote.get("source", "unknown")
+    if ref <= 0:
+        # Fallback: bid/ask midpoint. Often populated after-hours for major
+        # stocks even when last/close aren't, and valid for a drift check.
+        bid = quote.get("bid") or 0
+        ask = quote.get("ask") or 0
+        if bid > 0 and ask > 0:
+            ref = (bid + ask) / 2
+            source = f"{source} (bid/ask mid)"
     if ref <= 0:
         if require_quote:
             return {"ok": False, "error": "could not obtain reference price for symbol"}
@@ -63,7 +103,6 @@ async def _validate_order_inputs(symbol: str, action: str, quantity: int,
                 "warning": "no reference price available — will re-validate at confirm time"}
 
     drift = abs(limit_price - ref) / ref
-    source = quote.get("source", "unknown")
     if drift > MAX_QUOTE_DRIFT:
         return {"ok": False,
                 "error": f"limit ${limit_price:.2f} is {drift*100:.1f}% from last ${ref:.2f} "

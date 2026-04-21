@@ -396,6 +396,15 @@ class IBKRClient:
                 pass
             last, bid, ask, close, source = await _stream("delayed")
 
+        # If live+delayed both empty, try frozen — returns last known quote
+        # regardless of session state (intended for closed-market lookups).
+        if not any((last, bid, ask, close)):
+            try:
+                self.ib.reqMarketDataType(2)  # frozen
+            except Exception:
+                pass
+            last, bid, ask, close, source = await _stream("frozen")
+
         # Fallback: historical daily bars — works on paper without subscription.
         if not any((last, bid, ask, close)):
             try:
