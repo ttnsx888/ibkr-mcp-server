@@ -435,6 +435,136 @@ class IBKRClient:
             "source": source,
         }
 
+    @rate_limit(calls_per_second=0.2)
+    async def get_quotes(self, symbols: List[str]) -> Dict[str, Dict]:
+        """Batched quotes for multiple symbols.
+
+        Qualifies all contracts in one `qualifyContractsAsync` call, fans out
+        `reqMktData` concurrently (Semaphore(8)), and falls back per batch
+        through live → delayed → frozen, then per-symbol historical.
+        Returns `{symbol: {last, bid, ask, close, ...} | {error: ...}}`.
+
+        Per-symbol failures don't crash the batch; callers see an `error` key
+        on the affected symbol and the rest of the batch returns normally.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        symbols = [s.upper() for s in symbols]
+        results: Dict[str, Dict] = {}
+
+        # Qualify all contracts in one round-trip. Unqualified ones come back
+        # with conId == 0 — surface those as per-symbol errors.
+        contracts = [Stock(s, 'SMART', 'USD') for s in symbols]
+        try:
+            await self.ib.qualifyContractsAsync(*contracts)
+        except Exception as e:
+            self.logger.warning(f"qualifyContractsAsync batch failed: {e}")
+
+        sym_to_contract: Dict[str, object] = {}
+        pending: List[str] = []
+        for sym, c in zip(symbols, contracts):
+            if not getattr(c, "conId", 0):
+                results[sym] = {"symbol": sym, "error": "Contract not found"}
+            else:
+                sym_to_contract[sym] = c
+                pending.append(sym)
+
+        if not pending:
+            return results
+
+        def _valid(v):
+            return v is not None and not (isinstance(v, float) and v != v) and v > 0
+
+        sem = asyncio.Semaphore(8)
+
+        async def _stream_one(sym: str, mode_label: str):
+            async with sem:
+                contract = sym_to_contract[sym]
+                try:
+                    ticker = self.ib.reqMktData(contract, '', False, False)
+                    for _ in range(6):
+                        await asyncio.sleep(0.5)
+                        if any(_valid(v) for v in (ticker.last, ticker.close,
+                                                   ticker.bid, ticker.ask)):
+                            break
+                    try:
+                        self.ib.cancelMktData(contract)
+                    except Exception:
+                        pass
+                    return (
+                        sym,
+                        safe_float(ticker.last) if _valid(ticker.last) else 0.0,
+                        safe_float(ticker.bid) if _valid(ticker.bid) else 0.0,
+                        safe_float(ticker.ask) if _valid(ticker.ask) else 0.0,
+                        safe_float(ticker.close) if _valid(ticker.close) else 0.0,
+                        mode_label,
+                    )
+                except Exception as e:
+                    return (sym, 0.0, 0.0, 0.0, 0.0, f"error:{e}")
+
+        remaining = list(pending)
+        for mode_num, mode_label in [(1, "live"), (3, "delayed"), (2, "frozen")]:
+            if not remaining:
+                break
+            try:
+                self.ib.reqMarketDataType(mode_num)
+            except Exception:
+                pass
+            batch = await asyncio.gather(
+                *[_stream_one(s, mode_label) for s in remaining],
+                return_exceptions=True,
+            )
+            next_remaining: List[str] = []
+            for item in batch:
+                if isinstance(item, Exception):
+                    continue
+                sym, last, bid, ask, close, source = item
+                if any((last, bid, ask, close)):
+                    contract = sym_to_contract[sym]
+                    results[sym] = {
+                        "symbol": sym,
+                        "last": last, "bid": bid, "ask": ask, "close": close,
+                        "contract_id": contract.conId,
+                        "source": source,
+                    }
+                else:
+                    next_remaining.append(sym)
+            remaining = next_remaining
+
+        # Historical fallback — sequential is fine, this is the rare path.
+        for sym in remaining:
+            contract = sym_to_contract[sym]
+            filled = False
+            try:
+                bars = await self.ib.reqHistoricalDataAsync(
+                    contract,
+                    endDateTime='', durationStr='2 D', barSizeSetting='1 day',
+                    whatToShow='TRADES', useRTH=True, formatDate=1,
+                )
+                if bars:
+                    last_bar = bars[-1]
+                    results[sym] = {
+                        "symbol": sym,
+                        "last": safe_float(last_bar.close),
+                        "bid": 0.0, "ask": 0.0,
+                        "close": safe_float(last_bar.close),
+                        "contract_id": contract.conId,
+                        "source": f"historical (bar {last_bar.date})",
+                    }
+                    filled = True
+            except Exception as e:
+                self.logger.warning(f"Historical fallback failed for {sym}: {e}")
+            if not filled:
+                results[sym] = {
+                    "symbol": sym,
+                    "last": 0.0, "bid": 0.0, "ask": 0.0, "close": 0.0,
+                    "contract_id": contract.conId,
+                    "source": "unavailable",
+                }
+
+        return results
+
     @rate_limit(calls_per_second=0.5)
     async def place_limit_order(self, symbol: str, action: str, quantity: int,
                                 limit_price: float, tif: str = "DAY",

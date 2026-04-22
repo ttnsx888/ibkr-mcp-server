@@ -294,6 +294,27 @@ TOOLS = [
             "required": ["symbol"],
             "additionalProperties": False
         }
+    ),
+    Tool(
+        name="get_market_quotes",
+        description=(
+            "Batched snapshot quotes for multiple symbols in one call. "
+            "Qualifies contracts together and streams reqMktData concurrently, "
+            "which is much faster than calling get_market_quote in a loop. "
+            "Returns a dict keyed by symbol; per-symbol failures surface as "
+            "{\"error\": \"...\"} without crashing the rest of the batch."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbols": {
+                    "type": "string",
+                    "description": "Comma-separated list of symbols (max 50)"
+                }
+            },
+            "required": ["symbols"],
+            "additionalProperties": False
+        }
     )
 ]
 
@@ -528,6 +549,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
         elif name == "get_market_quote":
             quote = await ibkr_client.get_quote(validate_symbol(arguments["symbol"]))
             return [TextContent(type="text", text=json.dumps(quote, indent=2))]
+
+        elif name == "get_market_quotes":
+            try:
+                symbol_list = validate_symbols(arguments["symbols"])
+            except ValueError as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"error": str(e)}))]
+            quotes = await ibkr_client.get_quotes(symbol_list)
+            return [TextContent(type="text", text=json.dumps(quotes, indent=2))]
 
         else:
             return [TextContent(
