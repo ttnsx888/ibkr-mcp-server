@@ -569,6 +569,7 @@ class IBKRClient:
     async def place_limit_order(self, symbol: str, action: str, quantity: int,
                                 limit_price: float, tif: str = "DAY",
                                 outside_rth: bool = False,
+                                order_ref: str = "",
                                 account: Optional[str] = None) -> Dict:
         """Submit a limit order to IBKR. Does NOT stage — sends immediately."""
         if not await self._ensure_connected():
@@ -589,6 +590,7 @@ class IBKRClient:
             lmtPrice=float(limit_price),
             tif=tif.upper(),
             outsideRth=bool(outside_rth),
+            orderRef=str(order_ref or ""),
         )
         if account or self.current_account:
             order.account = account or self.current_account
@@ -620,6 +622,7 @@ class IBKRClient:
         trades = self.ib.openTrades()
         out = []
         for t in trades:
+            order_ref = (getattr(t.order, "orderRef", "") or "").strip()
             out.append({
                 "order_id": t.order.orderId,
                 "perm_id": t.order.permId,
@@ -634,6 +637,7 @@ class IBKRClient:
                 "filled": safe_float(t.orderStatus.filled),
                 "remaining": safe_float(t.orderStatus.remaining),
                 "account": t.order.account,
+                "source": order_ref or None,
             })
         return out
 

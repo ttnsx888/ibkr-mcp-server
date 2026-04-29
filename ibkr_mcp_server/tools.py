@@ -511,6 +511,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     quantity=order.quantity, limit_price=order.limit_price,
                     tif=order.tif,
                     outside_rth=order.outside_rth,
+                    order_ref=order.source,
                 )
             except Exception as e:
                 return [TextContent(type="text",
