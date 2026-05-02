@@ -2,10 +2,11 @@
 
 import asyncio
 import logging
+import time
 from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, LimitOrder, ExecutionFilter, util
+from ib_async import IB, Stock, LimitOrder, StopOrder, Order, ExecutionFilter, util
 from .config import settings
 from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
@@ -613,6 +614,276 @@ class IBKRClient:
             "account": order.account,
         }
 
+    async def place_stop_order(self, symbol: str, action: str, quantity: int,
+                                stop_price: float, tif: str = "GTC",
+                                outside_rth: bool = False,
+                                order_ref: str = "",
+                                oca_group: Optional[str] = None,
+                                oca_type: int = 0,
+                                parent_id: Optional[int] = None,
+                                transmit: bool = True,
+                                account: Optional[str] = None) -> Dict:
+        """Submit a STP order (`StopOrder`) to IBKR. Used for fail-safe stops
+        and BE-stops in the swing-monitor flow. Honors OCA grouping when
+        `oca_group` is set."""
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+        action = action.upper()
+        if action not in ("BUY", "SELL"):
+            raise ValidationError(f"Invalid action: {action}")
+        if stop_price <= 0:
+            raise ValidationError("stop_price must be positive")
+
+        contract = Stock(symbol.upper(), 'SMART', 'USD')
+        qualified = await self.ib.qualifyContractsAsync(contract)
+        if not qualified or not contract.conId:
+            raise ValidationError(f"Could not qualify contract for {symbol}")
+
+        order = StopOrder(
+            action=action,
+            totalQuantity=int(quantity),
+            stopPrice=float(stop_price),
+            tif=tif.upper(),
+            outsideRth=bool(outside_rth),
+            orderRef=str(order_ref or ""),
+        )
+        order.transmit = bool(transmit)
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType = int(oca_type or 2)   # default REDUCE_WITH_BLOCK
+        if parent_id:
+            order.parentId = int(parent_id)
+        if account or self.current_account:
+            order.account = account or self.current_account
+
+        trade = self.ib.placeOrder(contract, order)
+        await asyncio.sleep(1.0)
+
+        return {
+            "order_id":    trade.order.orderId,
+            "perm_id":     trade.order.permId,
+            "parent_id":   int(getattr(trade.order, "parentId", 0) or 0),
+            "symbol":      symbol.upper(),
+            "action":      action,
+            "quantity":    int(quantity),
+            "stop_price":  float(stop_price),
+            "order_type":  trade.order.orderType,
+            "oca_group":   getattr(trade.order, "ocaGroup", "") or None,
+            "oca_type":    int(getattr(trade.order, "ocaType", 0) or 0),
+            "tif":         tif.upper(),
+            "outside_rth": bool(outside_rth),
+            "transmit":    bool(transmit),
+            "status":      trade.orderStatus.status,
+            "filled":      safe_float(trade.orderStatus.filled),
+            "remaining":   safe_float(trade.orderStatus.remaining),
+            "account":     order.account,
+        }
+
+    async def place_bracket_order(self, symbol: str, parent_action: str,
+                                   parent_quantity: int, parent_limit_price: float,
+                                   children: List[Dict],
+                                   parent_tif: str = "GTC",
+                                   parent_outside_rth: bool = False,
+                                   order_ref: str = "",
+                                   account: Optional[str] = None) -> Dict:
+        """Place a bracket: one parent LMT entry + N OCA-linked SELL children.
+
+        `children` shape:
+          [{"order_type": "LMT" | "STP",
+            "action": "SELL",
+            "quantity": <int>,
+            "limit_price": <float>,    # if LMT
+            "stop_price":  <float>,    # if STP
+            "tif": <str> default "GTC",
+            "outside_rth": <bool>,
+            "oca_type": <int> default 2 (REDUCE_WITH_BLOCK),
+            "tag": <str> optional override to orderRef}, ...]
+
+        IBKR semantics: parent + children are linked via `parentId` so children
+        ONLY activate after parent fills. Children share an `ocaGroup`; with
+        `ocaType=2` (REDUCE_WITH_BLOCK), when one child fills, the others'
+        quantities reduce by the filled amount automatically — exactly the
+        scale-out + protective-stop pattern the swing strategy needs.
+
+        Atomicity: parent + intermediate children are placed with
+        `transmit=False`; the final child carries `transmit=True`, which tells
+        IBKR to commit the entire bracket as one unit.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+        parent_action = parent_action.upper()
+        if parent_action not in ("BUY", "SELL"):
+            raise ValidationError(f"Invalid parent_action: {parent_action}")
+        if parent_limit_price <= 0:
+            raise ValidationError("parent_limit_price must be positive")
+        if not children:
+            raise ValidationError("bracket must have at least one child")
+
+        contract = Stock(symbol.upper(), 'SMART', 'USD')
+        qualified = await self.ib.qualifyContractsAsync(contract)
+        if not qualified or not contract.conId:
+            raise ValidationError(f"Could not qualify contract for {symbol}")
+
+        oca_group = f"BRK_{symbol.upper()}_{int(time.time() * 1000)}"
+
+        # Parent: LMT, transmit=False (children will activate it on the last leg)
+        parent = LimitOrder(
+            action=parent_action,
+            totalQuantity=int(parent_quantity),
+            lmtPrice=float(parent_limit_price),
+            tif=parent_tif.upper(),
+            outsideRth=bool(parent_outside_rth),
+            orderRef=str(order_ref or ""),
+        )
+        parent.transmit = False
+        if account or self.current_account:
+            parent.account = account or self.current_account
+
+        parent_trade = self.ib.placeOrder(contract, parent)
+        # Tiny settle so IBKR assigns the orderId we'll reference.
+        await asyncio.sleep(0.3)
+        parent_order_id = parent_trade.order.orderId
+        if not parent_order_id:
+            raise IBKRConnectionError("IBKR did not assign orderId to parent")
+
+        child_results = []
+        n = len(children)
+        try:
+            for i, c in enumerate(children):
+                is_last = (i == n - 1)
+                ot = c.get("order_type", "LMT").upper()
+                action = c.get("action", "SELL").upper()
+                qty = int(c["quantity"])
+                tif = c.get("tif", "GTC").upper()
+                outside_rth = bool(c.get("outside_rth", False))
+                oca_type = int(c.get("oca_type", 2))
+                tag = c.get("tag") or f"{order_ref}_C{i}"
+
+                if ot == "LMT":
+                    child = LimitOrder(
+                        action=action, totalQuantity=qty,
+                        lmtPrice=float(c["limit_price"]),
+                        tif=tif, outsideRth=outside_rth,
+                        orderRef=str(tag),
+                    )
+                elif ot == "STP":
+                    child = StopOrder(
+                        action=action, totalQuantity=qty,
+                        stopPrice=float(c["stop_price"]),
+                        tif=tif, outsideRth=outside_rth,
+                        orderRef=str(tag),
+                    )
+                else:
+                    raise ValidationError(
+                        f"bracket child[{i}]: unsupported order_type {ot!r} (LMT or STP only)"
+                    )
+                child.parentId = parent_order_id
+                child.ocaGroup = oca_group
+                child.ocaType = oca_type
+                child.transmit = is_last
+                if account or self.current_account:
+                    child.account = account or self.current_account
+
+                trade = self.ib.placeOrder(contract, child)
+                child_results.append({
+                    "order_id":   trade.order.orderId,
+                    "perm_id":    trade.order.permId,
+                    "order_type": trade.order.orderType,
+                    "action":     action,
+                    "quantity":   qty,
+                    "limit_price": safe_float(getattr(trade.order, "lmtPrice", 0)),
+                    "stop_price":  safe_float(getattr(trade.order, "auxPrice", 0)),
+                    "oca_group":   oca_group,
+                    "oca_type":    oca_type,
+                    "tif":         tif,
+                    "outside_rth": outside_rth,
+                    "transmit":    is_last,
+                    "tag":         tag,
+                    "status":      trade.orderStatus.status,
+                })
+        except Exception:
+            # Atomicity: if any child fails, cancel the parent (transmit=False
+            # means it never reached the market — cancel just removes the
+            # provisional entry from IBKR's queue).
+            try:
+                self.ib.cancelOrder(parent_trade.order)
+                await asyncio.sleep(0.3)
+            except Exception:
+                pass
+            raise
+
+        await asyncio.sleep(0.5)
+        return {
+            "parent": {
+                "order_id":    parent_trade.order.orderId,
+                "perm_id":     parent_trade.order.permId,
+                "symbol":      symbol.upper(),
+                "action":      parent_action,
+                "quantity":    int(parent_quantity),
+                "limit_price": float(parent_limit_price),
+                "order_type":  parent_trade.order.orderType,
+                "tif":         parent_tif.upper(),
+                "outside_rth": bool(parent_outside_rth),
+                "status":      parent_trade.orderStatus.status,
+            },
+            "children":  child_results,
+            "oca_group": oca_group,
+            "account":   parent.account,
+        }
+
+    async def modify_order(self, order_id: int,
+                            quantity: Optional[int] = None,
+                            limit_price: Optional[float] = None,
+                            stop_price: Optional[float] = None) -> Dict:
+        """Modify a live order in place (no cancel + restage). Used by the
+        swing-monitor's post-T1 BE-stop transition: instead of cancel-then-stage
+        (which has a tiny no-coverage gap), bump the failsafe STP's price up
+        to entry and reduce qty.
+
+        Only fields that are provided are modified.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        oid = int(order_id)
+        target = None
+        for trade in self.ib.trades():
+            if trade.order.orderId == oid:
+                target = trade
+                break
+        if target is None:
+            return {"order_id": oid, "modified": False, "error": "order not found"}
+
+        original = {
+            "quantity":    safe_float(target.order.totalQuantity),
+            "limit_price": safe_float(getattr(target.order, "lmtPrice", 0)),
+            "stop_price":  safe_float(getattr(target.order, "auxPrice", 0)),
+        }
+        if quantity is not None:
+            target.order.totalQuantity = int(quantity)
+        if limit_price is not None:
+            target.order.lmtPrice = float(limit_price)
+        if stop_price is not None:
+            target.order.auxPrice = float(stop_price)
+        target.order.transmit = True
+
+        # Re-submit modified order with the same orderId — IBKR replaces it.
+        trade = self.ib.placeOrder(target.contract, target.order)
+        await asyncio.sleep(0.5)
+        return {
+            "order_id":   oid,
+            "perm_id":    trade.order.permId,
+            "symbol":     target.contract.symbol,
+            "modified":   True,
+            "original":   original,
+            "new": {
+                "quantity":    safe_float(trade.order.totalQuantity),
+                "limit_price": safe_float(getattr(trade.order, "lmtPrice", 0)),
+                "stop_price":  safe_float(getattr(trade.order, "auxPrice", 0)),
+            },
+            "status":     trade.orderStatus.status,
+        }
+
     @rate_limit(calls_per_second=1.0)
     async def get_open_trades(self) -> List[Dict]:
         """Return all currently-open trades."""
@@ -623,21 +894,30 @@ class IBKRClient:
         out = []
         for t in trades:
             order_ref = (getattr(t.order, "orderRef", "") or "").strip()
+            # STP / STP_LMT use auxPrice for the stop trigger price.
+            stop_price = safe_float(getattr(t.order, "auxPrice", 0))
+            ot = t.order.orderType
             out.append({
-                "order_id": t.order.orderId,
-                "perm_id": t.order.permId,
-                "symbol": t.contract.symbol,
-                "action": t.order.action,
-                "quantity": safe_float(t.order.totalQuantity),
+                "order_id":   t.order.orderId,
+                "perm_id":    t.order.permId,
+                "parent_id":  int(getattr(t.order, "parentId", 0) or 0),
+                "symbol":     t.contract.symbol,
+                "action":     t.order.action,
+                "quantity":   safe_float(t.order.totalQuantity),
                 "limit_price": safe_float(getattr(t.order, "lmtPrice", 0)),
-                "order_type": t.order.orderType,
-                "tif": t.order.tif,
+                "stop_price": stop_price if ot in ("STP", "STP LMT", "STP_LMT") else 0.0,
+                "order_type": ot,
+                "oca_group":  (getattr(t.order, "ocaGroup", "") or "") or None,
+                "oca_type":   int(getattr(t.order, "ocaType", 0) or 0),
+                "tif":        t.order.tif,
                 "outside_rth": bool(getattr(t.order, "outsideRth", False)),
-                "status": t.orderStatus.status,
-                "filled": safe_float(t.orderStatus.filled),
-                "remaining": safe_float(t.orderStatus.remaining),
-                "account": t.order.account,
-                "source": order_ref or None,
+                "transmit":   bool(getattr(t.order, "transmit", True)),
+                "status":     t.orderStatus.status,
+                "filled":     safe_float(t.orderStatus.filled),
+                "remaining":  safe_float(t.orderStatus.remaining),
+                "account":    t.order.account,
+                "source":     order_ref or None,
+                "tag":        order_ref or None,   # alias — most callers use `tag`
             })
         return out
 

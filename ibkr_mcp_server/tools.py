@@ -315,6 +315,101 @@ TOOLS = [
             "required": ["symbols"],
             "additionalProperties": False
         }
+    ),
+    Tool(
+        name="stage_stop_order",
+        description=(
+            "Validate and stage a STOP (STP) order for later approval. "
+            "Returns staged_id for confirm_order. Used for fail-safe protective "
+            "stops, BE-stops, and trailing stops. Honors OCA grouping when "
+            "`oca_group` is provided. Drift safety gate uses stop_price as the "
+            "reference."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol":      {"type": "string"},
+                "action":      {"type": "string", "enum": ["BUY", "SELL"]},
+                "quantity":    {"type": "integer", "minimum": 1},
+                "stop_price":  {"type": "number", "exclusiveMinimum": 0},
+                "tif":         {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "GTC"},
+                "outside_rth": {"type": "boolean", "default": False},
+                "oca_group":   {"type": "string",
+                                 "description": "OCA tag — orders sharing this group reduce/cancel each other on fill."},
+                "oca_type":    {"type": "integer", "enum": [0, 1, 2, 3], "default": 0,
+                                 "description": "0=none, 1=cancel-with-block, 2=reduce-with-block (default for brackets), 3=reduce-no-block"},
+                "source":      {"type": "string"}
+            },
+            "required": ["symbol", "action", "quantity", "stop_price"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="stage_bracket_order",
+        description=(
+            "Validate and stage a BRACKET order: parent BUY LMT entry plus "
+            "1+ OCA-linked SELL children (each LMT or STP). Children share "
+            "an OCA group with `oca_type=2` (REDUCE_WITH_BLOCK) by default — "
+            "when one fills, the others' quantities reduce automatically. "
+            "Returns the parent's staged_id (children carry parent_staged_id "
+            "linkage). `confirm_order` on the parent submits the entire "
+            "bracket atomically."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "symbol":              {"type": "string"},
+                "parent_action":       {"type": "string", "enum": ["BUY", "SELL"], "default": "BUY"},
+                "parent_quantity":     {"type": "integer", "minimum": 1},
+                "parent_limit_price":  {"type": "number", "exclusiveMinimum": 0},
+                "parent_tif":          {"type": "string", "enum": ["DAY", "GTC"], "default": "GTC"},
+                "parent_outside_rth":  {"type": "boolean", "default": False},
+                "children": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "order_type":  {"type": "string", "enum": ["LMT", "STP"]},
+                            "action":      {"type": "string", "enum": ["BUY", "SELL"], "default": "SELL"},
+                            "quantity":    {"type": "integer", "minimum": 1},
+                            "limit_price": {"type": "number", "exclusiveMinimum": 0},
+                            "stop_price":  {"type": "number", "exclusiveMinimum": 0},
+                            "tif":         {"type": "string", "enum": ["DAY", "GTC"], "default": "GTC"},
+                            "outside_rth": {"type": "boolean", "default": False},
+                            "oca_type":    {"type": "integer", "enum": [1, 2, 3], "default": 2},
+                            "tag":         {"type": "string"}
+                        },
+                        "required": ["order_type", "quantity"],
+                        "additionalProperties": False
+                    }
+                },
+                "source": {"type": "string"}
+            },
+            "required": ["symbol", "parent_quantity", "parent_limit_price", "children"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="modify_live_order",
+        description=(
+            "Modify a live IBKR order in place: change qty, limit_price, "
+            "and/or stop_price without cancel-then-restage (avoids the "
+            "no-coverage gap that arises when a protective order is removed "
+            "before its replacement is acknowledged). Pass only the fields "
+            "you want to change."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "order_id":    {"type": "integer"},
+                "quantity":    {"type": "integer", "minimum": 1},
+                "limit_price": {"type": "number", "exclusiveMinimum": 0},
+                "stop_price":  {"type": "number", "exclusiveMinimum": 0}
+            },
+            "required": ["order_id"],
+            "additionalProperties": False
+        }
     )
 ]
 
@@ -488,6 +583,17 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 return [TextContent(type="text",
                                     text=json.dumps({"submitted": False,
                                                      "error": "Staged order expired (>7d old). Re-stage."}))]
+            # Audit I3: confirming a bracket child solo would orphan the parent
+            # and siblings. Reject — caller must confirm the parent's staged_id,
+            # which submits the entire bracket atomically via place_bracket_order.
+            if order.parent_staged_id:
+                return [TextContent(type="text", text=json.dumps({
+                    "submitted": False,
+                    "error": (f"staged_id {staged_id} is a bracket child of "
+                              f"{order.parent_staged_id}. Confirm the parent "
+                              "instead — the entire bracket submits atomically."),
+                    "parent_staged_id": order.parent_staged_id,
+                }))]
 
             # Live-trading gate.
             if ibkr_client.port in LIVE_PORTS and not settings.enable_live_trading:
@@ -497,36 +603,255 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                               "Refusing to submit. Set ENABLE_LIVE_TRADING=true in .env to allow."),
                 }))]
 
-            # Re-validate against current market (strict — IBKR must be connected)
-            v = await _validate_order_inputs(order.symbol, order.action,
-                                             order.quantity, order.limit_price,
-                                             require_quote=True)
-            if not v["ok"]:
-                return [TextContent(type="text",
-                                    text=json.dumps({"submitted": False, "error": v["error"]}))]
+            # Re-validate against current market (strict — IBKR must be connected).
+            # For STP/STP_LMT orders, validate drift against stop_price (the trigger),
+            # since limit_price is 0 for pure STP.
+            ref_price = order.limit_price if order.order_type in ("LMT", "STP_LMT") else \
+                        (order.stop_price or 0)
+            if ref_price > 0:
+                v = await _validate_order_inputs(order.symbol, order.action,
+                                                 order.quantity, ref_price,
+                                                 require_quote=True)
+                if not v["ok"]:
+                    return [TextContent(type="text",
+                                        text=json.dumps({"submitted": False, "error": v["error"]}))]
+            else:
+                v = {"reference_price": None, "drift_pct": None, "reference_source": None}
 
+            # Bracket parent? Submit the whole bracket atomically via place_bracket_order.
+            children = staged_store.children_of(staged_id)
             try:
-                result = await ibkr_client.place_limit_order(
-                    symbol=order.symbol, action=order.action,
-                    quantity=order.quantity, limit_price=order.limit_price,
-                    tif=order.tif,
-                    outside_rth=order.outside_rth,
-                    order_ref=order.source,
-                )
+                if children:
+                    child_specs = []
+                    for c in children:
+                        spec = {
+                            "order_type":  c.order_type,
+                            "action":      c.action,
+                            "quantity":    c.quantity,
+                            "tif":         c.tif,
+                            "outside_rth": c.outside_rth,
+                            "oca_type":    c.oca_type or 2,
+                            "tag":         c.source,
+                        }
+                        if c.order_type == "LMT":
+                            spec["limit_price"] = c.limit_price
+                        elif c.order_type == "STP":
+                            spec["stop_price"] = c.stop_price
+                        else:
+                            return [TextContent(type="text", text=json.dumps({
+                                "submitted": False,
+                                "error": f"Unsupported child order_type for bracket: {c.order_type}",
+                            }))]
+                        child_specs.append(spec)
+                    result = await ibkr_client.place_bracket_order(
+                        symbol=order.symbol,
+                        parent_action=order.action,
+                        parent_quantity=order.quantity,
+                        parent_limit_price=order.limit_price,
+                        children=child_specs,
+                        parent_tif=order.tif,
+                        parent_outside_rth=order.outside_rth,
+                        order_ref=order.source,
+                    )
+                elif order.order_type == "LMT":
+                    result = await ibkr_client.place_limit_order(
+                        symbol=order.symbol, action=order.action,
+                        quantity=order.quantity, limit_price=order.limit_price,
+                        tif=order.tif, outside_rth=order.outside_rth,
+                        order_ref=order.source,
+                    )
+                elif order.order_type == "STP":
+                    result = await ibkr_client.place_stop_order(
+                        symbol=order.symbol, action=order.action,
+                        quantity=order.quantity, stop_price=order.stop_price,
+                        tif=order.tif, outside_rth=order.outside_rth,
+                        order_ref=order.source,
+                        oca_group=order.oca_group, oca_type=order.oca_type,
+                    )
+                else:
+                    return [TextContent(type="text", text=json.dumps({
+                        "submitted": False,
+                        "error": f"Unsupported order_type at confirm: {order.order_type}",
+                    }))]
             except Exception as e:
                 return [TextContent(type="text",
                                     text=json.dumps({"submitted": False,
                                                      "error": f"IBKR rejected order: {e}"}))]
 
-            staged_store.remove(staged_id)
+            # Cleanup local staged store: remove parent + bracket children together.
+            if children:
+                staged_store.remove_bracket(staged_id)
+            else:
+                staged_store.remove(staged_id)
             return [TextContent(type="text", text=json.dumps({
                 "submitted": True,
                 "staged_id": staged_id,
-                "reference_price": v["reference_price"],
-                "drift_pct": v["drift_pct"],
+                "reference_price": v.get("reference_price"),
+                "drift_pct": v.get("drift_pct"),
                 "reference_source": v.get("reference_source"),
+                "bracket": bool(children),
                 "ibkr": result,
+            }, indent=2, default=str))]
+
+        elif name == "stage_stop_order":
+            symbol = validate_symbol(arguments["symbol"])
+            action = arguments["action"]
+            quantity = int(arguments["quantity"])
+            stop_price = float(arguments["stop_price"])
+            tif = arguments.get("tif", "GTC")
+            outside_rth = bool(arguments.get("outside_rth", False))
+            source = arguments.get("source", "")
+            oca_group = arguments.get("oca_group")
+            oca_type = int(arguments.get("oca_type", 0))
+
+            v = await _validate_order_inputs(symbol, action, quantity, stop_price,
+                                              require_quote=False)
+            if not v["ok"]:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False, "error": v["error"]}))]
+
+            order = StagedOrder.new(symbol, action, quantity,
+                                     order_type="STP", stop_price=stop_price,
+                                     tif=tif, source=source,
+                                     outside_rth=outside_rth,
+                                     oca_group=oca_group, oca_type=oca_type)
+            staged_store.add(order)
+            return [TextContent(type="text", text=json.dumps({
+                "staged":           True,
+                "staged_id":        order.id,
+                "summary":          order.summary(),
+                "reference_price":  v.get("reference_price"),
+                "drift_pct":        v.get("drift_pct"),
+                "reference_source": v.get("reference_source"),
             }, indent=2))]
+
+        elif name == "stage_bracket_order":
+            symbol = validate_symbol(arguments["symbol"])
+            parent_action = arguments.get("parent_action", "BUY")
+            parent_qty = int(arguments["parent_quantity"])
+            parent_lmt = float(arguments["parent_limit_price"])
+            parent_tif = arguments.get("parent_tif", "GTC")
+            parent_outside_rth = bool(arguments.get("parent_outside_rth", False))
+            children = arguments["children"]
+            source = arguments.get("source", "")
+
+            # Validate parent against drift gate.
+            v_parent = await _validate_order_inputs(symbol, parent_action, parent_qty,
+                                                     parent_lmt, require_quote=False)
+            if not v_parent["ok"]:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False,
+                                                     "error": f"parent: {v_parent['error']}"}))]
+
+            # Validate each child up-front. Collect specs; nothing hits the
+            # store until all validations pass.
+            child_specs = []
+            for i, c in enumerate(children):
+                ot = c.get("order_type", "LMT").upper()
+                action = c.get("action", "SELL").upper()
+                qty = int(c["quantity"])
+                if ot == "LMT":
+                    lmt = float(c.get("limit_price", 0))
+                    if lmt <= 0:
+                        return [TextContent(type="text", text=json.dumps({
+                            "staged": False,
+                            "error": f"child[{i}] (LMT): limit_price > 0 required"}))]
+                    vc = await _validate_order_inputs(symbol, action, qty, lmt,
+                                                       require_quote=False)
+                elif ot == "STP":
+                    stp = float(c.get("stop_price", 0))
+                    if stp <= 0:
+                        return [TextContent(type="text", text=json.dumps({
+                            "staged": False,
+                            "error": f"child[{i}] (STP): stop_price > 0 required"}))]
+                    vc = await _validate_order_inputs(symbol, action, qty, stp,
+                                                       require_quote=False)
+                else:
+                    return [TextContent(type="text", text=json.dumps({
+                        "staged": False,
+                        "error": f"child[{i}]: unsupported order_type {ot!r}"}))]
+                if not vc["ok"]:
+                    return [TextContent(type="text", text=json.dumps({
+                        "staged": False,
+                        "error": f"child[{i}]: {vc['error']}"}))]
+                child_specs.append({**c, "order_type": ot, "action": action})
+
+            # Stage parent first so we have its id for child linkage. Use a
+            # provisional OCA group name reflecting the parent's id.
+            parent = StagedOrder.new(symbol, parent_action, parent_qty,
+                                      limit_price=parent_lmt,
+                                      order_type="LMT",
+                                      tif=parent_tif, source=source,
+                                      outside_rth=parent_outside_rth,
+                                      transmit_last=False)
+            staged_store.add(parent)
+            oca_group = f"BRK_{symbol.upper()}_{parent.id}"
+
+            # Stage children, all linked to the parent.
+            child_ids = []
+            n = len(child_specs)
+            for i, c in enumerate(child_specs):
+                ot = c["order_type"]
+                ch = StagedOrder.new(
+                    symbol,
+                    c.get("action", "SELL"),
+                    int(c["quantity"]),
+                    limit_price=float(c.get("limit_price", 0) or 0),
+                    order_type=ot,
+                    stop_price=float(c.get("stop_price", 0)) if ot == "STP" else None,
+                    tif=c.get("tif", "GTC"),
+                    source=c.get("tag") or f"{source}_C{i}",
+                    outside_rth=bool(c.get("outside_rth", False)),
+                    oca_group=oca_group,
+                    oca_type=int(c.get("oca_type", 2)),
+                    parent_staged_id=parent.id,
+                    transmit_last=(i == n - 1),
+                )
+                staged_store.add(ch)
+                child_ids.append(ch.id)
+
+            return [TextContent(type="text", text=json.dumps({
+                "staged":           True,
+                "staged_id":        parent.id,                      # parent id; confirm_order on this submits the bracket
+                "child_staged_ids": child_ids,
+                "oca_group":        oca_group,
+                "summary": {
+                    "parent":   parent.summary(),
+                    "children": [staged_store.get(cid).summary() for cid in child_ids],
+                },
+                "reference_price":  v_parent.get("reference_price"),
+                "drift_pct":        v_parent.get("drift_pct"),
+                "reference_source": v_parent.get("reference_source"),
+            }, indent=2))]
+
+        elif name == "modify_live_order":
+            order_id = int(arguments["order_id"])
+            qty = arguments.get("quantity")
+            lmt = arguments.get("limit_price")
+            stp = arguments.get("stop_price")
+            if qty is None and lmt is None and stp is None:
+                return [TextContent(type="text", text=json.dumps({
+                    "modified": False,
+                    "error": "must provide at least one of: quantity, limit_price, stop_price"}))]
+
+            # Live-trading gate (modify is a real submit).
+            if ibkr_client.port in LIVE_PORTS and not settings.enable_live_trading:
+                return [TextContent(type="text", text=json.dumps({
+                    "modified": False,
+                    "error": (f"Live port {ibkr_client.port} detected but ENABLE_LIVE_TRADING=false. "
+                              "Refusing to modify."),
+                }))]
+            try:
+                result = await ibkr_client.modify_order(
+                    order_id=order_id,
+                    quantity=int(qty) if qty is not None else None,
+                    limit_price=float(lmt) if lmt is not None else None,
+                    stop_price=float(stp) if stp is not None else None,
+                )
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({
+                    "modified": False, "error": f"IBKR modify failed: {e}"}))]
+            return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "cancel_staged_order":
             staged_id = arguments["staged_id"]
