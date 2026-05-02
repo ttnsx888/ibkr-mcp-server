@@ -208,6 +208,60 @@ def test_modify_live_order_requires_a_field():
     print(f"  ✓ modify_live_order rejects empty modify request")
 
 
+def test_m2_retry_on_transient_decorator():
+    """Audit M2: retry_on_transient retries on connection/timeout-like errors,
+    propagates immediately on validation/business errors."""
+    from ibkr_mcp_server.utils import retry_on_transient
+    import asyncio
+
+    # Counter to prove retry happened (or didn't)
+    state = {"calls": 0}
+
+    @retry_on_transient(max_attempts=2, delay=0.01)
+    async def transient_then_succeeds():
+        state["calls"] += 1
+        if state["calls"] < 2:
+            raise ConnectionError("temporary disconnect")
+        return "ok"
+
+    result = asyncio.get_event_loop().run_until_complete(transient_then_succeeds())
+    assert result == "ok"
+    assert state["calls"] == 2, f"expected 2 calls (1 fail + 1 retry), got {state['calls']}"
+
+    # Non-transient: ValueError must NOT retry
+    state2 = {"calls": 0}
+
+    @retry_on_transient(max_attempts=3, delay=0.01)
+    async def non_transient_fails():
+        state2["calls"] += 1
+        raise ValueError("limit_price too far from quote")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(non_transient_fails())
+        raise AssertionError("expected ValueError")
+    except ValueError:
+        pass
+    assert state2["calls"] == 1, \
+        f"non-transient should not retry, got {state2['calls']} calls"
+
+    # Transient that exhausts attempts
+    state3 = {"calls": 0}
+
+    @retry_on_transient(max_attempts=2, delay=0.01)
+    async def always_transient():
+        state3["calls"] += 1
+        raise asyncio.TimeoutError("timed out")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(always_transient())
+        raise AssertionError("expected TimeoutError")
+    except asyncio.TimeoutError:
+        pass
+    assert state3["calls"] == 2
+
+    print(f"  ✓ M2: retry_on_transient retries transient (1+1), skips non-transient (1), exhausts (2)")
+
+
 def test_confirm_order_rejects_bracket_child():
     """Audit I3: confirming a bracket child's staged_id alone would orphan
     the parent + siblings. confirm_order must reject with a helpful error."""
@@ -257,6 +311,7 @@ if __name__ == "__main__":
         test_bracket_remove_clears_all,
         test_validation_rejects_negative_stop,
         test_modify_live_order_requires_a_field,
+        test_m2_retry_on_transient_decorator,
         test_confirm_order_rejects_bracket_child,
     ]
     failed = 0

@@ -43,7 +43,7 @@ def rate_limit(calls_per_second: float = 2.0):
 def retry_on_failure(max_attempts: int = 3, delay: float = 1.0, backoff: float = 2.0):
     """
     Retry decorator for failed operations.
-    
+
     Args:
         max_attempts: Maximum number of retry attempts
         delay: Initial delay between retries
@@ -53,7 +53,7 @@ def retry_on_failure(max_attempts: int = 3, delay: float = 1.0, backoff: float =
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             last_exception = None
-            
+
             for attempt in range(max_attempts):
                 try:
                     return await func(*args, **kwargs)
@@ -68,9 +68,64 @@ def retry_on_failure(max_attempts: int = 3, delay: float = 1.0, backoff: float =
                         await asyncio.sleep(wait_time)
                     else:
                         logger.error(f"All {max_attempts} attempts failed for {func.__name__}")
-            
+
             raise last_exception
-        
+
+        return wrapper
+    return decorator
+
+
+def retry_on_transient(max_attempts: int = 2, delay: float = 5.0, backoff: float = 1.5):
+    """
+    Selective retry decorator for order placement (audit M2).
+
+    Only retries on transient failures: network errors, timeouts, IBKR
+    connection drops. Does NOT retry on validation errors or business-logic
+    rejections (insufficient buying power, halted symbol, etc.) — those
+    will keep failing the same way and just delay reporting.
+
+    Args:
+        max_attempts: total attempts including initial; default 2
+        delay: initial backoff seconds
+        backoff: multiplier
+    """
+    # Transient = exceptions whose class name suggests connectivity / timing.
+    # We do not retry on ValidationError, TradingError (live-port refusal),
+    # or APIError (which is the catch-all for IB-side rejections).
+    TRANSIENT_TYPES = (asyncio.TimeoutError, ConnectionError)
+    TRANSIENT_NAME_HINTS = ("timeout", "disconnect", "reset", "broken pipe",
+                             "connection", "temporarily")
+
+    def _is_transient(exc: Exception) -> bool:
+        if isinstance(exc, TRANSIENT_TYPES):
+            return True
+        msg = str(exc).lower()
+        return any(h in msg for h in TRANSIENT_NAME_HINTS)
+
+    def decorator(func: F) -> F:
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            last_exception = None
+            for attempt in range(max_attempts):
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    last_exception = e
+                    if not _is_transient(e):
+                        # Non-transient — surface immediately; retrying would
+                        # just delay the same rejection.
+                        raise
+                    if attempt < max_attempts - 1:
+                        wait_time = delay * (backoff ** attempt)
+                        logger.warning(
+                            f"transient failure on {func.__name__} "
+                            f"(attempt {attempt + 1}/{max_attempts}): {e}. "
+                            f"retrying in {wait_time:.1f}s"
+                        )
+                        await asyncio.sleep(wait_time)
+                    else:
+                        logger.error(f"all {max_attempts} attempts exhausted on {func.__name__}: {e}")
+            raise last_exception
         return wrapper
     return decorator
 

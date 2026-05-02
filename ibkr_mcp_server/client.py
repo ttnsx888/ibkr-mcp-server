@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from ib_async import IB, Stock, LimitOrder, StopOrder, Order, ExecutionFilter, util
 from .config import settings
-from .utils import rate_limit, retry_on_failure, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
+from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
 class IBKRClient:
@@ -567,12 +567,20 @@ class IBKRClient:
         return results
 
     @rate_limit(calls_per_second=0.5)
+    @retry_on_transient(max_attempts=2, delay=5.0)
     async def place_limit_order(self, symbol: str, action: str, quantity: int,
                                 limit_price: float, tif: str = "DAY",
                                 outside_rth: bool = False,
                                 order_ref: str = "",
                                 account: Optional[str] = None) -> Dict:
-        """Submit a limit order to IBKR. Does NOT stage — sends immediately."""
+        """Submit a limit order to IBKR. Does NOT stage — sends immediately.
+
+        Audit M2: wrapped with @retry_on_transient — one retry after a 5s
+        backoff if the call raises a transient (network/timeout) error.
+        Non-transient errors (validation, business logic, halted symbol)
+        propagate immediately — retrying them would just delay the same
+        rejection.
+        """
         if not await self._ensure_connected():
             raise IBKRConnectionError("Not connected to IBKR")
 
@@ -614,6 +622,7 @@ class IBKRClient:
             "account": order.account,
         }
 
+    @retry_on_transient(max_attempts=2, delay=5.0)
     async def place_stop_order(self, symbol: str, action: str, quantity: int,
                                 stop_price: float, tif: str = "GTC",
                                 outside_rth: bool = False,
@@ -679,6 +688,7 @@ class IBKRClient:
             "account":     order.account,
         }
 
+    @retry_on_transient(max_attempts=2, delay=5.0)
     async def place_bracket_order(self, symbol: str, parent_action: str,
                                    parent_quantity: int, parent_limit_price: float,
                                    children: List[Dict],
@@ -831,6 +841,7 @@ class IBKRClient:
             "account":   parent.account,
         }
 
+    @retry_on_transient(max_attempts=2, delay=5.0)
     async def modify_order(self, order_id: int,
                             quantity: Optional[int] = None,
                             limit_price: Optional[float] = None,
