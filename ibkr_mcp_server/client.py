@@ -572,6 +572,8 @@ class IBKRClient:
                                 limit_price: float, tif: str = "DAY",
                                 outside_rth: bool = False,
                                 order_ref: str = "",
+                                oca_group: Optional[str] = None,
+                                oca_type: int = 0,
                                 account: Optional[str] = None) -> Dict:
         """Submit a limit order to IBKR. Does NOT stage — sends immediately.
 
@@ -580,6 +582,11 @@ class IBKRClient:
         Non-transient errors (validation, business logic, halted symbol)
         propagate immediately — retrying them would just delay the same
         rejection.
+
+        OCA: when `oca_group` is set, orders sharing the group are linked
+        on IBKR's side and cancel/reduce on first fill per `oca_type`. Used
+        by /swing-scout to stage multiple sibling BUY LMTs that must not
+        co-fill on opening gap-throughs (2026-05-14).
         """
         if not await self._ensure_connected():
             raise IBKRConnectionError("Not connected to IBKR")
@@ -601,6 +608,9 @@ class IBKRClient:
             outsideRth=bool(outside_rth),
             orderRef=str(order_ref or ""),
         )
+        if oca_group:
+            order.ocaGroup = oca_group
+            order.ocaType  = int(oca_type)
         if account or self.current_account:
             order.account = account or self.current_account
 
@@ -608,18 +618,20 @@ class IBKRClient:
         await asyncio.sleep(1.0)  # let IBKR echo initial status
 
         return {
-            "order_id": trade.order.orderId,
-            "perm_id": trade.order.permId,
-            "symbol": symbol.upper(),
-            "action": action,
-            "quantity": int(quantity),
+            "order_id":    trade.order.orderId,
+            "perm_id":     trade.order.permId,
+            "symbol":      symbol.upper(),
+            "action":      action,
+            "quantity":    int(quantity),
             "limit_price": float(limit_price),
-            "tif": tif.upper(),
+            "tif":         tif.upper(),
             "outside_rth": bool(outside_rth),
-            "status": trade.orderStatus.status,
-            "filled": safe_float(trade.orderStatus.filled),
-            "remaining": safe_float(trade.orderStatus.remaining),
-            "account": order.account,
+            "oca_group":   getattr(trade.order, "ocaGroup", "") or None,
+            "oca_type":    getattr(trade.order, "ocaType", 0) or 0,
+            "status":      trade.orderStatus.status,
+            "filled":      safe_float(trade.orderStatus.filled),
+            "remaining":   safe_float(trade.orderStatus.remaining),
+            "account":     order.account,
         }
 
     @retry_on_transient(max_attempts=2, delay=5.0)

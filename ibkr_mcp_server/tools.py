@@ -203,7 +203,10 @@ TOOLS = [
     Tool(
         name="stage_order",
         description=("Validate and stage a limit order for later approval. Does NOT submit to IBKR. "
-                     "Applies MAX_ORDER_SIZE and quote-drift safety gates. Returns a staged_id for confirm_order."),
+                     "Applies MAX_ORDER_SIZE and quote-drift safety gates. Returns a staged_id for confirm_order. "
+                     "Honors OCA grouping when `oca_group` is provided — siblings sharing the same group "
+                     "auto-cancel each other on first fill (used by /swing-scout to stage multiple sibling "
+                     "BUY LMTs that must not co-fill on opening gap-throughs)."),
         inputSchema={
             "type": "object",
             "properties": {
@@ -214,6 +217,11 @@ TOOLS = [
                 "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "DAY"},
                 "outside_rth": {"type": "boolean", "default": False,
                                  "description": "Allow order to trigger/fill outside regular trading hours"},
+                "oca_group": {"type": "string",
+                                "description": "OCA tag — orders sharing this group cancel/reduce on first fill."},
+                "oca_type":  {"type": "integer", "enum": [0, 1, 2, 3], "default": 1,
+                                "description": ("0=none, 1=cancel-with-block (default for entry-side siblings — "
+                                                 "one fills, the rest are cancelled), 2=reduce-with-block, 3=reduce-no-block.")},
                 "source": {"type": "string", "description": "Provenance tag, e.g. 'scan 2026-04-15 AMD T1'"}
             },
             "required": ["symbol", "action", "quantity", "limit_price"],
@@ -545,6 +553,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             tif = arguments.get("tif", "DAY")
             outside_rth = bool(arguments.get("outside_rth", False))
             source = arguments.get("source", "")
+            oca_group = arguments.get("oca_group")
+            oca_type = int(arguments.get("oca_type", 1))   # default = CANCEL_WITH_BLOCK for entry-side siblings
 
             v = await _validate_order_inputs(symbol, action, quantity, limit_price,
                                                require_quote=False)
@@ -552,7 +562,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 return [TextContent(type="text", text=json.dumps({"staged": False, "error": v["error"]}))]
 
             order = StagedOrder.new(symbol, action, quantity, limit_price,
-                                    tif=tif, source=source, outside_rth=outside_rth)
+                                    tif=tif, source=source, outside_rth=outside_rth,
+                                    oca_group=oca_group, oca_type=oca_type)
             staged_store.add(order)
             return [TextContent(type="text", text=json.dumps({
                 "staged": True,
@@ -659,6 +670,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                         quantity=order.quantity, limit_price=order.limit_price,
                         tif=order.tif, outside_rth=order.outside_rth,
                         order_ref=order.source,
+                        oca_group=order.oca_group, oca_type=order.oca_type,
                     )
                 elif order.order_type == "STP":
                     result = await ibkr_client.place_stop_order(
