@@ -973,17 +973,46 @@ class IBKRClient:
         them. reqExecutions pulls straight from TWS's own day-log and survives
         reconnects within the same trading day.
 
+        Each fill is enriched with the parent order's `orderRef` so callers can
+        reconcile against tagged orders after they roll off `get_live_orders`.
+        `Execution.orderRef` from execDetails is preferred; if empty (a known IBKR
+        quirk depending on protocol version / reconnect state) we fall back to a
+        `permId → orderRef` map built from `ib.trades()` for the current session.
+
         Args:
             account: optional account filter. If None, returns fills for all
                      accounts visible on this connection.
 
         Returns a list of dicts with fields aligned to the scan report's
-        `filled_orders[]` schema. `source` is NOT populated here (executions don't
-        carry the caller's scan/tier tag); callers enrich by joining on `order_id`
-        against their own `submitted_orders[]` record if they need it.
+        `filled_orders[]` schema. `tag`, `order_ref`, and `source` are aliases for
+        the parent order's `orderRef` — `tag` mirrors the field name used by
+        `get_open_trades` so merge code can read the same key on both sides.
         """
         if not await self._ensure_connected():
             raise IBKRConnectionError("Not connected to IBKR")
+
+        # Build permId → orderRef fallback map from session trades. Execution
+        # records from reqExecutionsAsync don't always carry orderRef (the IB
+        # protocol delivers it on execDetails, but partial replays after
+        # reconnect can drop it), so we need an alternate lookup. Trades from
+        # the current ib.trades() cache survive the live-orders rolloff window
+        # because they're held in-process for the session.
+        permid_to_ref: Dict[int, str] = {}
+        orderid_to_ref: Dict[int, str] = {}
+        try:
+            for t in self.ib.trades():
+                ref = (getattr(t.order, "orderRef", "") or "").strip()
+                if not ref:
+                    continue
+                pid = int(getattr(t.order, "permId", 0) or 0)
+                oid = int(getattr(t.order, "orderId", 0) or 0)
+                if pid:
+                    permid_to_ref[pid] = ref
+                if oid:
+                    orderid_to_ref[oid] = ref
+        except Exception:
+            # Best-effort fallback map — never block fills retrieval on it.
+            pass
 
         # Empty ExecutionFilter → today's executions, all accounts on the connection.
         filt = ExecutionFilter()
@@ -1003,6 +1032,15 @@ class IBKRClient:
             side = execution.side
             action = "BUY" if side == "BOT" else "SELL" if side == "SLD" else side
 
+            # Prefer the direct field, then permId, then orderId.
+            order_ref = (getattr(execution, "orderRef", "") or "").strip()
+            if not order_ref:
+                pid = int(getattr(execution, "permId", 0) or 0)
+                order_ref = permid_to_ref.get(pid, "")
+            if not order_ref:
+                oid = int(getattr(execution, "orderId", 0) or 0)
+                order_ref = orderid_to_ref.get(oid, "")
+
             out.append({
                 "order_id": execution.orderId,
                 "perm_id": execution.permId,
@@ -1017,6 +1055,9 @@ class IBKRClient:
                 "commission_currency": getattr(comm, "currency", ""),
                 "account": execution.acctNumber,
                 "exchange": execution.exchange,
+                "order_ref": order_ref or None,
+                "tag":       order_ref or None,
+                "source":    order_ref or None,
             })
         return out
 

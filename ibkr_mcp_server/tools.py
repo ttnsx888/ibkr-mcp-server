@@ -273,9 +273,12 @@ TOOLS = [
             "across reconnects within the trading day — unlike get_live_orders, "
             "which drops fully-reconciled entries. Use this in post-hoc reports "
             "(e.g. evening scan 'Today's Filled Orders' section) where fills "
-            "may have rolled off the live-orders window. Pass an optional "
-            "`account` to filter; otherwise returns fills for all accounts on "
-            "the connection."
+            "may have rolled off the live-orders window. Each fill is enriched "
+            "with the parent order's orderRef under the `tag` / `order_ref` / "
+            "`source` keys (matching `get_live_orders`), so callers can merge "
+            "the two responses by tag to reconcile filled tagged orders. "
+            "Pass an optional `account` to filter; otherwise returns fills for "
+            "all accounts on the connection."
         ),
         inputSchema={
             "type": "object",
