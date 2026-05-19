@@ -159,6 +159,25 @@ class TestIBKRClient:
         assert by_symbol["NVDA"]["tag"] == "SWING_FIB_GOLDEN_003"
 
     @pytest.mark.asyncio
+    async def test_get_todays_fills_warms_trades_cache(self, ibkr_client_mock):
+        """get_todays_fills must request open + completed orders before reading
+        the trades cache. Each Claude tick spawns a fresh MCP process so
+        `ib.trades()` starts empty; without warming, the orderRef fallback
+        misses any order placed by a prior process. Regression guard for the
+        2026-05-18 SPY/QQQ/NVDA naked-position incident.
+        """
+        ibkr_client_mock.ib.reqAllOpenOrdersAsync = AsyncMock(return_value=None)
+        ibkr_client_mock.ib.reqCompletedOrdersAsync = AsyncMock(return_value=None)
+        ibkr_client_mock.ib.trades.return_value = []
+        ibkr_client_mock.ib.reqExecutionsAsync = AsyncMock(return_value=[])
+
+        await ibkr_client_mock.get_todays_fills()
+
+        ibkr_client_mock.ib.reqAllOpenOrdersAsync.assert_awaited_once()
+        ibkr_client_mock.ib.reqCompletedOrdersAsync.assert_awaited_once_with(
+            apiOnly=False)
+
+    @pytest.mark.asyncio
     async def test_get_todays_fills_untagged_returns_none(self, ibkr_client_mock):
         """Fill with no matching tag in any source → tag/order_ref/source = None."""
         from datetime import datetime

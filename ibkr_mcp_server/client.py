@@ -994,9 +994,36 @@ class IBKRClient:
         # Build permId → orderRef fallback map from session trades. Execution
         # records from reqExecutionsAsync don't always carry orderRef (the IB
         # protocol delivers it on execDetails, but partial replays after
-        # reconnect can drop it), so we need an alternate lookup. Trades from
-        # the current ib.trades() cache survive the live-orders rolloff window
-        # because they're held in-process for the session.
+        # reconnect can drop it), so we need an alternate lookup.
+        #
+        # CRITICAL (2026-05-18 swing-monitor incident): each Claude tick spawns
+        # a fresh MCP server process, so `self.ib.trades()` starts EMPTY on
+        # every call. The previous implementation relied on trades placed in
+        # the current process being present in `ib.trades()`, but for tick T2
+        # looking up a BUY filled in tick T1, that cache is cold and orderRef
+        # lookup silently returned None — breaking the swing skill's
+        # `live_orders ∪ todays_fills` merge and leaving 3 SWING positions
+        # naked for ~55min.
+        #
+        # Fix: warm the trades cache before lookup by requesting both
+        #   1. all open orders across all clients (catches BUYs still resting)
+        #   2. completed orders for this session (catches BUYs filled-and-gone)
+        # Each populates `self.ib.trades()` with the corresponding Trade
+        # objects, including their `order.orderRef`. Errors are non-fatal —
+        # the direct `execution.orderRef` path still works for current-process
+        # placements.
+        try:
+            await self.ib.reqAllOpenOrdersAsync()
+        except Exception:
+            pass
+        try:
+            # apiOnly=False → include orders placed by other clients (TWS UI,
+            # other MCP sessions). Matches the cross-client coverage the
+            # swing-monitor needs to reconcile fills after a process restart.
+            await self.ib.reqCompletedOrdersAsync(apiOnly=False)
+        except Exception:
+            pass
+
         permid_to_ref: Dict[int, str] = {}
         orderid_to_ref: Dict[int, str] = {}
         try:
