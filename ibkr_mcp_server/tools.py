@@ -20,6 +20,18 @@ MAX_QUOTE_DRIFT = 0.30  # reject staging/confirming if limit is >30% away from l
                         # MUST match MAX_SUBMIT_DRIFT_PCT in /Users/ttang/Trader/scripts/compute_signals.py
                         # so the scanner pre-filter and this server-side gate agree.
 
+# Resting SELL LMTs above market (e.g. swing T1 profit targets) are
+# non-aggressive — they can't cross the book on current liquidity, so the
+# fat-finger risk is much lower than for marketable orders. BBTAST_LONG
+# swing setups target 3.5R T1 (V3 tuning in
+# /Users/ttang/Trader/scripts/setups/bbtast_long.py); when the per-share
+# stop is wide (~11%+ of price) the resulting T1 sits ~38%+ above entry
+# and the 30% gate blocks every stage/repair attempt (S-R0b on INTU,
+# 2026-05-27 — 4 consecutive rejections).
+# Scope is narrow on purpose: DCA resting BUYs stay on the 30% gate so
+# the scanner pre-filter contract is preserved.
+MAX_QUOTE_DRIFT_RESTING_SELL = 0.60
+
 # Per-symbol quote cache shared by stage_order / confirm_order validation.
 # During a scan, a single symbol's tiers (T1/T2/T3) all validate against the
 # same reference price — and confirm_order fires seconds after stage_order.
@@ -103,10 +115,12 @@ async def _validate_order_inputs(symbol: str, action: str, quantity: int,
                 "warning": "no reference price available — will re-validate at confirm time"}
 
     drift = abs(limit_price - ref) / ref
-    if drift > MAX_QUOTE_DRIFT:
+    is_resting_sell_above = (action == "SELL" and limit_price > ref)
+    effective_max = MAX_QUOTE_DRIFT_RESTING_SELL if is_resting_sell_above else MAX_QUOTE_DRIFT
+    if drift > effective_max:
         return {"ok": False,
                 "error": f"limit ${limit_price:.2f} is {drift*100:.1f}% from last ${ref:.2f} "
-                         f"(max {MAX_QUOTE_DRIFT*100:.0f}%, source={source}). Refusing."}
+                         f"(max {effective_max*100:.0f}%, source={source}). Refusing."}
     return {"ok": True, "reference_price": ref, "drift_pct": round(drift * 100, 2),
             "reference_source": source}
 
