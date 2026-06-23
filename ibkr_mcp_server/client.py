@@ -7,6 +7,7 @@ from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
 from ib_async import IB, Stock, LimitOrder, StopOrder, Order, ExecutionFilter, util
+from . import order_ref_cache
 from .config import settings
 from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
@@ -615,7 +616,13 @@ class IBKRClient:
             order.account = account or self.current_account
 
         trade = self.ib.placeOrder(contract, order)
-        await asyncio.sleep(1.0)  # let IBKR echo initial status
+        await asyncio.sleep(1.0)  # let IBKR echo initial status (also lets permId arrive)
+
+        # Persist (perm_id, order_id) -> orderRef so get_todays_fills can recover
+        # the tag cross-client after this order rolls off the open-orders window
+        # (2026-06-23 manual-exit null-tag fix). Best-effort; never blocks.
+        order_ref_cache.record(trade.order.permId, trade.order.orderId,
+                               order_ref, order.account)
 
         return {
             "order_id":    trade.order.orderId,
@@ -679,6 +686,10 @@ class IBKRClient:
 
         trade = self.ib.placeOrder(contract, order)
         await asyncio.sleep(1.0)
+
+        # Persist tag for cross-client fill recovery (see place_limit_order).
+        order_ref_cache.record(trade.order.permId, trade.order.orderId,
+                               order_ref, order.account)
 
         return {
             "order_id":    trade.order.orderId,
@@ -835,6 +846,14 @@ class IBKRClient:
             raise
 
         await asyncio.sleep(0.5)
+
+        # Persist tags for cross-client fill recovery (see place_limit_order).
+        order_ref_cache.record(parent_trade.order.permId,
+                               parent_trade.order.orderId, order_ref, parent.account)
+        for cr in child_results:
+            order_ref_cache.record(cr.get("perm_id"), cr.get("order_id"),
+                                   cr.get("tag"), parent.account)
+
         return {
             "parent": {
                 "order_id":    parent_trade.order.orderId,
@@ -1048,6 +1067,17 @@ class IBKRClient:
 
         fills = await self.ib.reqExecutionsAsync(filt)
 
+        # Tier-4 fallback source: placement-time (perm_id|order_id) -> orderRef
+        # written to disk by every place_*_order call. Recovers the tag for a
+        # fill whose order was placed by a different client_id (e.g.
+        # swing_manual_exit_now.py = 47) and rolled off open-orders, so neither
+        # the execution nor reqCompletedOrders carries it cross-client
+        # (2026-06-23 manual-exit null-tag incident). Loaded once per call.
+        try:
+            persist_perm_to_ref = order_ref_cache.load_map()
+        except Exception:
+            persist_perm_to_ref = {}
+
         out = []
         for f in fills:
             execution = f.execution
@@ -1059,14 +1089,20 @@ class IBKRClient:
             side = execution.side
             action = "BUY" if side == "BOT" else "SELL" if side == "SLD" else side
 
-            # Prefer the direct field, then permId, then orderId.
+            # Prefer the direct field, then permId, then orderId (live session),
+            # then the persisted placement-time cache (cross-client / rolled-off).
             order_ref = (getattr(execution, "orderRef", "") or "").strip()
+            pid = int(getattr(execution, "permId", 0) or 0)
+            oid = int(getattr(execution, "orderId", 0) or 0)
             if not order_ref:
-                pid = int(getattr(execution, "permId", 0) or 0)
                 order_ref = permid_to_ref.get(pid, "")
             if not order_ref:
-                oid = int(getattr(execution, "orderId", 0) or 0)
                 order_ref = orderid_to_ref.get(oid, "")
+            if not order_ref:
+                # Tier 4 keys on permId ONLY (globally unique, safe
+                # cross-client). orderId is client-scoped — a cross-client
+                # orderId match could attach a wrong tag, worse than None.
+                order_ref = persist_perm_to_ref.get(pid, "")
 
             out.append({
                 "order_id": execution.orderId,

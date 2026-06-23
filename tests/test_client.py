@@ -217,3 +217,100 @@ class TestIBKRClient:
         assert fills[0]["tag"] is None
         assert fills[0]["order_ref"] is None
         assert fills[0]["source"] is None
+
+    @pytest.mark.asyncio
+    async def test_get_todays_fills_tier4_recovers_tag_from_cache(self, ibkr_client_mock):
+        """Tier-4 fallback: a fill whose execution has no orderRef and is absent
+        from the trades cache (different client_id, rolled off open-orders) still
+        recovers its tag from the placement-time order_ref_cache by perm_id.
+
+        Direct regression for the 2026-06-23 incident: swing_manual_exit_now.py
+        (client_id 47) closed AMD; the SELL filled + rolled off; the swing-monitor
+        tick (client_id 1) read it with tag=None, so Step 1.7's
+        pending_close_filled map could not detect it (s_manual_amd_reconcile_no_tag).
+        """
+        from datetime import datetime
+        from ibkr_mcp_server import order_ref_cache
+
+        # The placing process (client 47) recorded the tag at stage time.
+        order_ref_cache.record(perm_id=8888, order_id=6666,
+                               order_ref="SWING_MANUAL_100_2026-06-23_0909",
+                               account="U4022128")
+
+        execution = MagicMock()
+        execution.execId = "m1"
+        execution.orderId = 6666
+        execution.permId = 8888
+        execution.side = "SLD"
+        execution.shares = 28
+        execution.price = 522.05
+        execution.avgPrice = 522.05
+        execution.time = datetime(2026, 6, 23, 14, 25, 0)
+        execution.acctNumber = "U4022128"
+        execution.exchange = "SMART"
+        execution.orderRef = ""                       # cross-client: empty on execDetails
+
+        contract = MagicMock()
+        contract.symbol = "AMD"
+
+        comm = MagicMock()
+        comm.commission = 1.0
+        comm.currency = "USD"
+
+        fill = MagicMock()
+        fill.execution = execution
+        fill.contract = contract
+        fill.commissionReport = comm
+
+        ibkr_client_mock.ib.trades.return_value = []  # tiers 2/3 miss (rolled off)
+        ibkr_client_mock.ib.reqExecutionsAsync = AsyncMock(return_value=[fill])
+
+        fills = await ibkr_client_mock.get_todays_fills()
+
+        assert fills[0]["symbol"] == "AMD"
+        assert fills[0]["action"] == "SELL"
+        assert fills[0]["tag"] == "SWING_MANUAL_100_2026-06-23_0909"
+        assert fills[0]["order_ref"] == "SWING_MANUAL_100_2026-06-23_0909"
+        assert fills[0]["source"] == "SWING_MANUAL_100_2026-06-23_0909"
+
+    @pytest.mark.asyncio
+    async def test_get_todays_fills_tier4_no_orderid_bleed(self, ibkr_client_mock):
+        """A fill with permId=0 must NOT pick up a foreign order's tag via a
+        colliding (client-scoped) orderId. Tier-4 keys on permId only, so the
+        result is None — never a wrong tag. Guards the H1 footgun."""
+        from datetime import datetime
+        from ibkr_mcp_server import order_ref_cache
+
+        # A different order (perm 999) happens to share orderId=3 (client-scoped).
+        order_ref_cache.record(perm_id=999, order_id=3, order_ref="SWING_FOREIGN_TAG")
+
+        execution = MagicMock()
+        execution.execId = "z1"
+        execution.orderId = 3                          # collides with the cached row
+        execution.permId = 0                           # unresolved permId on this exec
+        execution.side = "SLD"
+        execution.shares = 10
+        execution.price = 100.0
+        execution.avgPrice = 100.0
+        execution.time = datetime(2026, 6, 23, 15, 0, 0)
+        execution.acctNumber = "U4022128"
+        execution.exchange = "SMART"
+        execution.orderRef = ""
+
+        contract = MagicMock()
+        contract.symbol = "FOO"
+        comm = MagicMock()
+        comm.commission = 1.0
+        comm.currency = "USD"
+        fill = MagicMock()
+        fill.execution = execution
+        fill.contract = contract
+        fill.commissionReport = comm
+
+        ibkr_client_mock.ib.trades.return_value = []
+        ibkr_client_mock.ib.reqExecutionsAsync = AsyncMock(return_value=[fill])
+
+        fills = await ibkr_client_mock.get_todays_fills()
+
+        assert fills[0]["symbol"] == "FOO"
+        assert fills[0]["tag"] is None                 # NOT "SWING_FOREIGN_TAG"
