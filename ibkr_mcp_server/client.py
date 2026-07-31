@@ -172,7 +172,11 @@ class IBKRClient:
             summary_tags = [
                 'TotalCashValue', 'NetLiquidation', 'UnrealizedPnL', 'RealizedPnL',
                 'GrossPositionValue', 'BuyingPower', 'EquityWithLoanValue',
-                'PreviousDayEquityWithLoanValue', 'FullInitMarginReq', 'FullMaintMarginReq'
+                'PreviousDayEquityWithLoanValue', 'FullInitMarginReq', 'FullMaintMarginReq',
+                # Funds gate (tools._buy_funds_gate, 2026-07-31): AvailableFunds
+                # is the placement ceiling; SettledCash informs cash accounts;
+                # AccountType ("CASH" vs margin) picks the ceiling tag.
+                'AvailableFunds', 'SettledCash', 'AccountType'
             ]
             
             # New ib_async API: accountSummaryAsync() handles the underlying

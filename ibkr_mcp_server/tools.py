@@ -61,6 +61,140 @@ async def _cached_get_quote(symbol: str) -> dict:
     return quote
 
 
+# ---------------------------------------------------------------------------
+# BUY funds gate (2026-07-31).
+#
+# IBKR does NOT reject a BUY that exceeds a cash account's funds — it accepts
+# the order and parks it 'Inactive', where it can activate in arbitrary
+# sequence when cash frees up, or silently evaporate. (2026-07-29 incident:
+# the fund-manager scan rested $20.6k of Inactive BUY LMTs against $189 cash
+# on live-U25242754 and recorded them all as submitted.) This gate refuses
+# the order up front: BUY notional must fit inside the account's funds
+# ceiling minus what open BUY orders have already committed.
+#
+# Mirrored in the scanner as STRATEGY.md §8h (compute_signals.py cash gate);
+# this server-side check is the account-level backstop that protects every
+# caller, not just the watchlist scan.
+# ---------------------------------------------------------------------------
+
+_FUNDS_CACHE: dict[str, tuple[float, dict]] = {}
+_FUNDS_CACHE_TTL = 30.0  # seconds — same reasoning as the quote cache
+
+
+def _fnum(v) -> "float | None":
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    # ib_async leaves unset numeric fields at UNSET_DOUBLE (~1.8e308).
+    return f if abs(f) < 1e9 else None
+
+
+async def _funds_snapshot(account: "str | None") -> dict:
+    """{tag: value} from get_account_summary, cached per account for TTL secs."""
+    key = account or ibkr_client.current_account or "ALL"
+    now = time.monotonic()
+    entry = _FUNDS_CACHE.get(key)
+    if entry is not None and now - entry[0] < _FUNDS_CACHE_TTL:
+        return entry[1]
+    rows = await ibkr_client.get_account_summary(account)
+    snap: dict = {}
+    for r in rows:
+        tag, ccy = r.get("tag"), (r.get("currency") or "")
+        # Multi-currency accounts repeat tags per currency — prefer USD/BASE.
+        if tag in snap and ccy not in ("USD", "BASE", ""):
+            continue
+        snap[tag] = r.get("value")
+    _FUNDS_CACHE[key] = (now, snap)
+    return snap
+
+
+def _open_buy_notional(account: "str | None") -> float:
+    """Unfilled notional committed to open BUY orders on `account`.
+
+    Includes Inactive parked orders — they consume cash the moment IBKR
+    activates them. openTrades() is local client state, no API round-trip.
+    Orders with no usable price (MKT) are skipped — rare for resting BUYs.
+    """
+    total = 0.0
+    try:
+        for t in ibkr_client.ib.openTrades():
+            o = t.order
+            if getattr(o, "action", "") != "BUY":
+                continue
+            if account and getattr(o, "account", "") and o.account != account:
+                continue
+            rem = _fnum(t.orderStatus.remaining) or _fnum(o.totalQuantity) or 0.0
+            px = _fnum(getattr(o, "lmtPrice", None)) or \
+                 _fnum(getattr(o, "auxPrice", None)) or 0.0
+            if rem > 0 and px > 0:
+                total += rem * px
+    except Exception:
+        pass  # deduction is best-effort; the ceiling itself is still enforced
+    return total
+
+
+async def _buy_funds_gate(action: str, quantity: int, price: float,
+                          strict: bool) -> dict:
+    """Refuse a BUY whose notional exceeds funds headroom.
+
+    headroom = ceiling − open BUY notional, where ceiling is
+    AvailableFunds (CASH accounts; fallback TotalCashValue) or
+    BuyingPower (margin accounts; fallback AvailableFunds).
+
+    strict=False (stage time): fail-open with a warning when IBKR is
+    offline or the summary fetch fails — confirm re-validates.
+    strict=True (confirm time): those failures refuse the order, same
+    contract as the quote-drift gate.
+    """
+    if action.upper() != "BUY" or price <= 0 or quantity <= 0:
+        return {"ok": True}
+    if not ibkr_client.is_connected():
+        if strict:
+            return {"ok": False, "error": "IBKR not connected — cannot validate funds"}
+        return {"ok": True,
+                "warning": "IBKR offline — funds check skipped, will re-validate at confirm time"}
+    try:
+        snap = await _funds_snapshot(None)
+    except Exception as e:
+        if strict:
+            return {"ok": False, "error": f"funds lookup failed: {e}"}
+        return {"ok": True,
+                "warning": f"funds lookup failed ({e}) — will re-validate at confirm time"}
+
+    acct_type = str(snap.get("AccountType", "")).upper()
+    if acct_type == "CASH":
+        candidates = [("AvailableFunds", snap.get("AvailableFunds")),
+                      ("TotalCashValue", snap.get("TotalCashValue"))]
+    else:
+        candidates = [("BuyingPower", snap.get("BuyingPower")),
+                      ("AvailableFunds", snap.get("AvailableFunds"))]
+    ceiling, ceiling_tag = None, None
+    for tag, raw in candidates:
+        ceiling = _fnum(raw)
+        if ceiling is not None:
+            ceiling_tag = tag
+            break
+    if ceiling is None:
+        if strict:
+            return {"ok": False, "error": "could not obtain funds figure for account"}
+        return {"ok": True,
+                "warning": "no funds figure available — will re-validate at confirm time"}
+
+    account = ibkr_client.current_account
+    open_buy = _open_buy_notional(account)
+    notional = quantity * price
+    headroom = ceiling - open_buy
+    if notional > headroom + 0.01:
+        return {"ok": False, "error": (
+            f"BUY notional ${notional:,.2f} exceeds available funds: "
+            f"{ceiling_tag} ${ceiling:,.2f} − ${open_buy:,.2f} committed to open "
+            f"BUY orders = ${headroom:,.2f} headroom "
+            f"(account {account or 'current'}"
+            f"{', CASH' if acct_type == 'CASH' else ''}). Refusing.")}
+    return {"ok": True, "funds_headroom_after": round(headroom - notional, 2)}
+
+
 async def _validate_order_inputs(symbol: str, action: str, quantity: int,
                                  limit_price: float,
                                  require_quote: bool = True) -> dict:
@@ -217,7 +351,7 @@ TOOLS = [
     Tool(
         name="stage_order",
         description=("Validate and stage a limit order for later approval. Does NOT submit to IBKR. "
-                     "Applies MAX_ORDER_SIZE and quote-drift safety gates. Returns a staged_id for confirm_order. "
+                     "Applies MAX_ORDER_SIZE, quote-drift, and BUY funds-headroom safety gates. Returns a staged_id for confirm_order. "
                      "Honors OCA grouping when `oca_group` is provided — siblings sharing the same group "
                      "auto-cancel each other on first fill (used by /swing-scout to stage multiple sibling "
                      "BUY LMTs that must not co-fill on opening gap-throughs)."),
@@ -578,6 +712,10 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             if not v["ok"]:
                 return [TextContent(type="text", text=json.dumps({"staged": False, "error": v["error"]}))]
 
+            fg = await _buy_funds_gate(action, quantity, limit_price, strict=False)
+            if not fg["ok"]:
+                return [TextContent(type="text", text=json.dumps({"staged": False, "error": fg["error"]}))]
+
             order = StagedOrder.new(symbol, action, quantity, limit_price,
                                     tif=tif, source=source, outside_rth=outside_rth,
                                     oca_group=oca_group, oca_type=oca_type)
@@ -589,6 +727,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 "reference_price": v["reference_price"],
                 "drift_pct": v["drift_pct"],
                 "reference_source": v.get("reference_source"),
+                "funds_warning": fg.get("warning"),
             }, indent=2))]
 
         elif name == "list_staged_orders":
@@ -645,6 +784,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                                         text=json.dumps({"submitted": False, "error": v["error"]}))]
             else:
                 v = {"reference_price": None, "drift_pct": None, "reference_source": None}
+
+            # Funds gate — strict at confirm time (same contract as the drift
+            # gate above). For brackets only the parent consumes cash; the
+            # SELL children pass through _buy_funds_gate untouched.
+            fg = await _buy_funds_gate(order.action, order.quantity,
+                                       ref_price if ref_price > 0 else 0.0,
+                                       strict=True)
+            if not fg["ok"]:
+                return [TextContent(type="text",
+                                    text=json.dumps({"submitted": False, "error": fg["error"]}))]
 
             # Bracket parent? Submit the whole bracket atomically via place_bracket_order.
             children = staged_store.children_of(staged_id)
@@ -739,6 +888,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 return [TextContent(type="text",
                                     text=json.dumps({"staged": False, "error": v["error"]}))]
 
+            fg = await _buy_funds_gate(action, quantity, stop_price, strict=False)
+            if not fg["ok"]:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False, "error": fg["error"]}))]
+
             order = StagedOrder.new(symbol, action, quantity,
                                      order_type="STP", stop_price=stop_price,
                                      tif=tif, source=source,
@@ -771,6 +925,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 return [TextContent(type="text",
                                     text=json.dumps({"staged": False,
                                                      "error": f"parent: {v_parent['error']}"}))]
+
+            # Funds gate on the parent (children are exits — no cash needed).
+            fg_parent = await _buy_funds_gate(parent_action, parent_qty, parent_lmt,
+                                              strict=False)
+            if not fg_parent["ok"]:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False,
+                                                     "error": f"parent: {fg_parent['error']}"}))]
 
             # Validate each child up-front. Collect specs; nothing hits the
             # store until all validations pass.
