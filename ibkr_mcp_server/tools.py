@@ -138,9 +138,19 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
                           strict: bool) -> dict:
     """Refuse a BUY whose notional exceeds funds headroom.
 
-    headroom = ceiling − open BUY notional, where ceiling is
-    AvailableFunds (CASH accounts; fallback TotalCashValue) or
-    BuyingPower (margin accounts; fallback AvailableFunds).
+    CASH accounts: headroom = AvailableFunds (fallback TotalCashValue)
+    − total open BUY notional. Cash is consumed dollar-for-dollar as
+    resting BUYs fill, and IBKR parks over-committed cash-account BUYs
+    Inactive instead of rejecting them (§8h), so the worst-case
+    all-fills sum is the right check.
+
+    Margin accounts: this order's notional is checked against
+    BuyingPower (fallback AvailableFunds) alone — open BUY notional is
+    NOT deducted. IBKR enforces margin per-fill natively on margin
+    accounts, so summing every resting BUY (e.g. operator DCA ladders)
+    only produces false refusals (2026-08-12 MSFT/AVGO swing incident).
+    A non-blocking warning is attached when the all-fills sum would
+    exceed the ceiling.
 
     strict=False (stage time): fail-open with a warning when IBKR is
     offline or the summary fetch fails — confirm re-validates.
@@ -182,17 +192,30 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
                 "warning": "no funds figure available — will re-validate at confirm time"}
 
     account = ibkr_client.current_account
-    open_buy = _open_buy_notional(account)
     notional = quantity * price
-    headroom = ceiling - open_buy
-    if notional > headroom + 0.01:
+    open_buy = _open_buy_notional(account)
+    if acct_type == "CASH":
+        headroom = ceiling - open_buy
+        if notional > headroom + 0.01:
+            return {"ok": False, "error": (
+                f"BUY notional ${notional:,.2f} exceeds available funds: "
+                f"{ceiling_tag} ${ceiling:,.2f} − ${open_buy:,.2f} committed to open "
+                f"BUY orders = ${headroom:,.2f} headroom "
+                f"(account {account or 'current'}, CASH). Refusing.")}
+        return {"ok": True, "funds_headroom_after": round(headroom - notional, 2)}
+
+    # Margin: IBKR enforces margin per-fill; gate only the incremental order.
+    if notional > ceiling + 0.01:
         return {"ok": False, "error": (
-            f"BUY notional ${notional:,.2f} exceeds available funds: "
-            f"{ceiling_tag} ${ceiling:,.2f} − ${open_buy:,.2f} committed to open "
-            f"BUY orders = ${headroom:,.2f} headroom "
-            f"(account {account or 'current'}"
-            f"{', CASH' if acct_type == 'CASH' else ''}). Refusing.")}
-    return {"ok": True, "funds_headroom_after": round(headroom - notional, 2)}
+            f"BUY notional ${notional:,.2f} exceeds {ceiling_tag} "
+            f"${ceiling:,.2f} (account {account or 'current'}, margin). Refusing.")}
+    result = {"ok": True, "funds_headroom_after": round(ceiling - notional, 2)}
+    if open_buy and notional + open_buy > ceiling:
+        result["warning"] = (
+            f"all-fills exposure ${notional + open_buy:,.2f} (this order plus "
+            f"${open_buy:,.2f} resting BUYs) exceeds {ceiling_tag} ${ceiling:,.2f}; "
+            f"not blocking — IBKR margin checks apply at fill time")
+    return result
 
 
 async def _validate_order_inputs(symbol: str, action: str, quantity: int,

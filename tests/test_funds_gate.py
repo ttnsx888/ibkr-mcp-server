@@ -83,6 +83,31 @@ class TestBuyFundsGate:
         r = await _buy_funds_gate("BUY", 100, 150.0, strict=False)
         assert r["ok"]
 
+    async def test_margin_resting_buys_do_not_block(self, monkeypatch):
+        """2026-08-12 incident: operator DCA ladders ($199k resting BUYs)
+        must not starve a small swing BUY on a margin account — IBKR
+        enforces margin per-fill natively. A non-blocking warning notes
+        the all-fills exposure."""
+        _client(monkeypatch, open_trades=[
+            _trade(remaining=400, lmt=207.5),   # ~$83k NVDA-style ladder
+            _trade(remaining=280, lmt=415.0),   # ~$116k more
+        ])
+        _snapshot(monkeypatch, {"AccountType": "INDIVIDUAL",
+                                "AvailableFunds": "56679",
+                                "BuyingPower": "200001"})
+        r = await _buy_funds_gate("BUY", 16, 485.54, strict=False)
+        assert r["ok"]
+        assert "warning" in r and "all-fills exposure" in r["warning"]
+
+    async def test_margin_order_over_buying_power_refused(self, monkeypatch):
+        _client(monkeypatch)
+        _snapshot(monkeypatch, {"AccountType": "INDIVIDUAL",
+                                "AvailableFunds": "5000",
+                                "BuyingPower": "20000"})
+        r = await _buy_funds_gate("BUY", 100, 250.0, strict=False)  # $25k > BP
+        assert not r["ok"]
+        assert "BuyingPower" in r["error"]
+
     async def test_offline_fails_open_at_stage_closed_at_confirm(self, monkeypatch):
         _client(monkeypatch, connected=False)
         r = await _buy_funds_gate("BUY", 10, 100.0, strict=False)
