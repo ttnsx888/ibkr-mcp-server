@@ -377,7 +377,10 @@ TOOLS = [
                      "Applies MAX_ORDER_SIZE, quote-drift, and BUY funds-headroom safety gates. Returns a staged_id for confirm_order. "
                      "Honors OCA grouping when `oca_group` is provided — siblings sharing the same group "
                      "auto-cancel each other on first fill (used by /swing-scout to stage multiple sibling "
-                     "BUY LMTs that must not co-fill on opening gap-throughs)."),
+                     "BUY LMTs that must not co-fill on opening gap-throughs). "
+                     "Pass tif='OPG' to stage a limit-on-open for the next session's opening auction — "
+                     "required for end-of-day exits staged after the 16:00 close, which IBKR otherwise "
+                     "parks Inactive and drops overnight."),
         inputSchema={
             "type": "object",
             "properties": {
@@ -385,9 +388,16 @@ TOOLS = [
                 "action": {"type": "string", "enum": ["BUY", "SELL"]},
                 "quantity": {"type": "integer", "minimum": 1},
                 "limit_price": {"type": "number", "exclusiveMinimum": 0},
-                "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "DAY"},
+                "tif": {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK", "OPG"], "default": "DAY",
+                        "description": ("Time in force. OPG = limit-on-open: the order participates ONLY "
+                                        "in the next session's opening auction and is cancelled if unfilled. "
+                                        "Use OPG for end-of-day exits staged after the 16:00 close — a "
+                                        "marketable LMT with DAY/GTC is parked Inactive by IBKR and "
+                                        "evaporates overnight. OPG forces outside_rth=False.")},
                 "outside_rth": {"type": "boolean", "default": False,
-                                 "description": "Allow order to trigger/fill outside regular trading hours"},
+                                 "description": ("Allow order to trigger/fill outside regular trading hours. "
+                                                 "Ignored (forced False) when tif=OPG — IBKR rejects "
+                                                 "outsideRth on opening-auction orders.")},
                 "oca_group": {"type": "string",
                                 "description": "OCA tag — orders sharing this group cancel/reduce on first fill."},
                 "oca_type":  {"type": "integer", "enum": [0, 1, 2, 3], "default": 1,
@@ -514,7 +524,10 @@ TOOLS = [
                 "action":      {"type": "string", "enum": ["BUY", "SELL"]},
                 "quantity":    {"type": "integer", "minimum": 1},
                 "stop_price":  {"type": "number", "exclusiveMinimum": 0},
-                "tif":         {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "GTC"},
+                "tif":         {"type": "string", "enum": ["DAY", "GTC", "IOC", "FOK"], "default": "GTC",
+                                 "description": ("Time in force. OPG is NOT available here — IBKR only "
+                                                 "accepts opening-auction TIFs on LMT/MKT order types. "
+                                                 "For an opening-auction exit use stage_order with tif='OPG'.")},
                 "outside_rth": {"type": "boolean", "default": False},
                 "oca_group":   {"type": "string",
                                  "description": "OCA tag — orders sharing this group reduce/cancel each other on fill."},
@@ -739,14 +752,28 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             if not fg["ok"]:
                 return [TextContent(type="text", text=json.dumps({"staged": False, "error": fg["error"]}))]
 
-            order = StagedOrder.new(symbol, action, quantity, limit_price,
-                                    tif=tif, source=source, outside_rth=outside_rth,
-                                    oca_group=oca_group, oca_type=oca_type)
+            try:
+                order = StagedOrder.new(symbol, action, quantity, limit_price,
+                                        tif=tif, source=source, outside_rth=outside_rth,
+                                        oca_group=oca_group, oca_type=oca_type)
+            except ValueError as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False, "error": str(e)}))]
             staged_store.add(order)
+            # OPG coerces outside_rth off (IBKR rejects outsideRth on auction
+            # orders). Surface it so the caller's log shows what was actually
+            # staged rather than what it asked for.
+            tif_note = None
+            if outside_rth and not order.outside_rth:
+                tif_note = (f"tif={order.tif}: outside_rth forced False "
+                            "(IBKR rejects outsideRth on opening-auction orders)")
             return [TextContent(type="text", text=json.dumps({
                 "staged": True,
                 "staged_id": order.id,
                 "summary": order.summary(),
+                "tif": order.tif,
+                "outside_rth": order.outside_rth,
+                "tif_note": tif_note,
                 "reference_price": v["reference_price"],
                 "drift_pct": v["drift_pct"],
                 "reference_source": v.get("reference_source"),
@@ -916,11 +943,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 return [TextContent(type="text",
                                     text=json.dumps({"staged": False, "error": fg["error"]}))]
 
-            order = StagedOrder.new(symbol, action, quantity,
-                                     order_type="STP", stop_price=stop_price,
-                                     tif=tif, source=source,
-                                     outside_rth=outside_rth,
-                                     oca_group=oca_group, oca_type=oca_type)
+            try:
+                order = StagedOrder.new(symbol, action, quantity,
+                                         order_type="STP", stop_price=stop_price,
+                                         tif=tif, source=source,
+                                         outside_rth=outside_rth,
+                                         oca_group=oca_group, oca_type=oca_type)
+            except ValueError as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False, "error": str(e)}))]
             staged_store.add(order)
             return [TextContent(type="text", text=json.dumps({
                 "staged":           True,
@@ -992,35 +1023,48 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
 
             # Stage parent first so we have its id for child linkage. Use a
             # provisional OCA group name reflecting the parent's id.
-            parent = StagedOrder.new(symbol, parent_action, parent_qty,
-                                      limit_price=parent_lmt,
-                                      order_type="LMT",
-                                      tif=parent_tif, source=source,
-                                      outside_rth=parent_outside_rth,
-                                      transmit_last=False)
+            try:
+                parent = StagedOrder.new(symbol, parent_action, parent_qty,
+                                          limit_price=parent_lmt,
+                                          order_type="LMT",
+                                          tif=parent_tif, source=source,
+                                          outside_rth=parent_outside_rth,
+                                          transmit_last=False)
+            except ValueError as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False,
+                                                     "error": f"parent: {e}"}))]
             staged_store.add(parent)
             oca_group = f"BRK_{symbol.upper()}_{parent.id}"
 
-            # Stage children, all linked to the parent.
+            # Stage children, all linked to the parent. A child that fails
+            # model-level validation must not leave a half-built bracket in
+            # the store — roll the parent back out.
             child_ids = []
             n = len(child_specs)
             for i, c in enumerate(child_specs):
                 ot = c["order_type"]
-                ch = StagedOrder.new(
-                    symbol,
-                    c.get("action", "SELL"),
-                    int(c["quantity"]),
-                    limit_price=float(c.get("limit_price", 0) or 0),
-                    order_type=ot,
-                    stop_price=float(c.get("stop_price", 0)) if ot == "STP" else None,
-                    tif=c.get("tif", "GTC"),
-                    source=c.get("tag") or f"{source}_C{i}",
-                    outside_rth=bool(c.get("outside_rth", False)),
-                    oca_group=oca_group,
-                    oca_type=int(c.get("oca_type", 2)),
-                    parent_staged_id=parent.id,
-                    transmit_last=(i == n - 1),
-                )
+                try:
+                    ch = StagedOrder.new(
+                        symbol,
+                        c.get("action", "SELL"),
+                        int(c["quantity"]),
+                        limit_price=float(c.get("limit_price", 0) or 0),
+                        order_type=ot,
+                        stop_price=float(c.get("stop_price", 0)) if ot == "STP" else None,
+                        tif=c.get("tif", "GTC"),
+                        source=c.get("tag") or f"{source}_C{i}",
+                        outside_rth=bool(c.get("outside_rth", False)),
+                        oca_group=oca_group,
+                        oca_type=int(c.get("oca_type", 2)),
+                        parent_staged_id=parent.id,
+                        transmit_last=(i == n - 1),
+                    )
+                except ValueError as e:
+                    staged_store.remove_bracket(parent.id)
+                    return [TextContent(type="text",
+                                        text=json.dumps({"staged": False,
+                                                         "error": f"child[{i}]: {e}"}))]
                 staged_store.add(ch)
                 child_ids.append(ch.id)
 

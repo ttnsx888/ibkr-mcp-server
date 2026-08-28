@@ -25,6 +25,25 @@ STAGED_TTL_DAYS = 7
 
 VALID_ORDER_TYPES = ("LMT", "STP", "STP_LMT", "MKT", "MOC", "MOO")
 
+# Time-in-force values accepted by the staging path.
+#   DAY / GTC / IOC / FOK — ordinary resting or immediate-or-cancel orders.
+#   OPG — "at the open". On a LMT this is IBKR's limit-on-open (LOO); on a
+#         MKT/MOO it is market-on-open. The order participates ONLY in the
+#         next session's opening auction and is cancelled if it doesn't fill.
+#
+# OPG exists so end-of-day exits can be staged after the 16:00 close: a
+# marketable LMT staged post-close is parked 'Inactive' by IBKR and evaporates
+# overnight (2026-06-25 INTC/META incident; the swing engine's V4.7 fix routes
+# EOD exits to an opening-auction order). Before 2026-08-28 the MCP staging
+# schema only advertised DAY/GTC/IOC/FOK, so callers silently downgraded OPG
+# to GTC and reproduced the original failure (2026-08-24 TSM #7516 / QQQ #7518).
+VALID_TIFS = ("DAY", "GTC", "IOC", "FOK", "OPG")
+
+# IBKR only accepts TIF=OPG on auction-eligible order types. A STP/STP_LMT
+# with OPG is rejected broker-side, so refuse it here rather than let the
+# caller discover it at confirm time.
+OPG_ORDER_TYPES = ("LMT", "MKT", "MOO")
+
 
 @dataclass
 class StagedOrder:
@@ -65,13 +84,35 @@ class StagedOrder:
             raise ValueError(f"stop_price required for order_type={ot}")
         if ot in ("LMT", "STP_LMT") and limit_price <= 0:
             raise ValueError(f"limit_price required (>0) for order_type={ot}")
+
+        tif_u = (tif or "DAY").upper()
+        if tif_u not in VALID_TIFS:
+            raise ValueError(f"tif must be one of {VALID_TIFS}, got {tif_u!r}")
+        if tif_u == "OPG":
+            if ot not in OPG_ORDER_TYPES:
+                raise ValueError(
+                    f"tif=OPG is only valid for order_type in {OPG_ORDER_TYPES}, got {ot!r}"
+                )
+            if outside_rth:
+                # IBKR rejects outsideRth on opening-auction orders, and the
+                # opening auction is RTH by definition. Coerce rather than
+                # raise: exit callers set outside_rth=True as a matter of
+                # course (swing SELL LMTs), and a raise would drop the exit
+                # entirely — the exact failure OPG is here to prevent.
+                logger.warning(
+                    "tif=OPG on %s %s: forcing outside_rth=False "
+                    "(IBKR rejects outsideRth on opening-auction orders)",
+                    action, symbol,
+                )
+                outside_rth = False
+
         return cls(
             id=str(uuid.uuid4())[:8],
             symbol=symbol.upper(),
             action=action.upper(),
             quantity=int(quantity),
             limit_price=float(limit_price or 0.0),
-            tif=tif.upper(),
+            tif=tif_u,
             source=source,
             created_at=now.isoformat(timespec="seconds"),
             expires_at=(now + timedelta(days=STAGED_TTL_DAYS)).isoformat(timespec="seconds"),

@@ -600,6 +600,18 @@ class IBKRClient:
         if action not in ("BUY", "SELL"):
             raise ValidationError(f"Invalid action: {action}")
 
+        # TIF=OPG makes this a limit-on-open: it participates only in the next
+        # session's opening auction. IBKR rejects outsideRth on auction orders
+        # (and the opening auction is RTH by definition), so force it off here
+        # too — the staging layer coerces it, but place_limit_order is also
+        # callable directly.
+        tif = (tif or "DAY").upper()
+        if tif == "OPG" and outside_rth:
+            self.logger.warning(
+                f"{symbol.upper()} {action}: tif=OPG — forcing outsideRth=False"
+            )
+            outside_rth = False
+
         contract = Stock(symbol.upper(), 'SMART', 'USD')
         qualified = await self.ib.qualifyContractsAsync(contract)
         if not qualified or not contract.conId:
@@ -609,7 +621,7 @@ class IBKRClient:
             action=action,
             totalQuantity=int(quantity),
             lmtPrice=float(limit_price),
-            tif=tif.upper(),
+            tif=tif,
             outsideRth=bool(outside_rth),
             orderRef=str(order_ref or ""),
         )
@@ -635,7 +647,7 @@ class IBKRClient:
             "action":      action,
             "quantity":    int(quantity),
             "limit_price": float(limit_price),
-            "tif":         tif.upper(),
+            "tif":         tif,
             "outside_rth": bool(outside_rth),
             "oca_group":   getattr(trade.order, "ocaGroup", "") or None,
             "oca_type":    getattr(trade.order, "ocaType", 0) or 0,
@@ -665,6 +677,12 @@ class IBKRClient:
             raise ValidationError(f"Invalid action: {action}")
         if stop_price <= 0:
             raise ValidationError("stop_price must be positive")
+        # IBKR only accepts opening-auction TIFs on LMT/MKT order types.
+        if (tif or "").upper() == "OPG":
+            raise ValidationError(
+                "tif=OPG is not valid on a STP order — IBKR accepts opening-auction "
+                "TIFs on LMT/MKT only. Use place_limit_order/stage_order with tif='OPG'."
+            )
 
         contract = Stock(symbol.upper(), 'SMART', 'USD')
         qualified = await self.ib.qualifyContractsAsync(contract)
@@ -755,6 +773,9 @@ class IBKRClient:
             raise ValidationError("parent_limit_price must be positive")
         if not children:
             raise ValidationError("bracket must have at least one child")
+        parent_tif = (parent_tif or "GTC").upper()
+        if parent_tif == "OPG":
+            parent_outside_rth = False   # IBKR rejects outsideRth on auction orders
 
         contract = Stock(symbol.upper(), 'SMART', 'USD')
         qualified = await self.ib.qualifyContractsAsync(contract)
@@ -793,6 +814,12 @@ class IBKRClient:
                 qty = int(c["quantity"])
                 tif = c.get("tif", "GTC").upper()
                 outside_rth = bool(c.get("outside_rth", False))
+                if tif == "OPG":
+                    if ot != "LMT":
+                        raise ValidationError(
+                            f"bracket child[{i}]: tif=OPG is valid on LMT only (got {ot!r})"
+                        )
+                    outside_rth = False   # IBKR rejects outsideRth on auction orders
                 oca_type = int(c.get("oca_type", 2))
                 tag = c.get("tag") or f"{order_ref}_C{i}"
 
