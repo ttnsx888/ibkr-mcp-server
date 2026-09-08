@@ -203,9 +203,9 @@ Enable debug logging by updating the environment variables:
 
 ### Log Files
 
-Check logs for issues:
+Check logs for issues (default path; override with `IBKR_MCP_LOG_FILE`):
 ```bash
-tail -f /tmp/ibkr-mcp-server.log
+tail -f ~/.trader/logs/ibkr_mcp_server.log
 ```
 
 ## Configuration Backup

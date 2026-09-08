@@ -1,6 +1,7 @@
 """IBKR Client with advanced trading capabilities."""
 
 import asyncio
+import collections
 import logging
 import time
 from typing import Dict, List, Optional, Union
@@ -14,11 +15,25 @@ from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float,
 
 class IBKRClient:
     """Enhanced IBKR client with multi-account and short selling support."""
-    
+
+    # Diagnostics: how many recent errorEvents to retain per-order and
+    # globally (2026-09-08 PLTR SWING_ SELL LMT incident — confirm_order
+    # returned status "Cancelled" twice with no attached reason because
+    # IBKR's rejection text was logged and discarded, never surfaced).
+    _PER_ORDER_ERROR_RING_SIZE = 20
+    _GLOBAL_ERROR_RING_SIZE = 50
+
+    # orderStatus values that can indicate a synchronous IBKR-side reject
+    # rather than an operator-requested cancel. Only these statuses trigger
+    # the brief extra settle wait in _finalize_order_result — a deliberate
+    # cancel_order() call ending in "Cancelled" is the expected outcome and
+    # must not pay that wait every time.
+    _REJECT_STATUSES = frozenset({"Cancelled", "Inactive", "ApiCancelled"})
+
     def __init__(self):
         self.ib: Optional[IB] = None
         self.logger = logging.getLogger(__name__)
-        
+
         # Connection settings
         self.host = settings.ibkr_host
         self.port = settings.ibkr_port
@@ -26,14 +41,21 @@ class IBKRClient:
         self.max_reconnect_attempts = settings.max_reconnect_attempts
         self.reconnect_delay = settings.reconnect_delay
         self.reconnect_attempts = 0
-        
+
         # Account management
         self.accounts: List[str] = []
         self.current_account: Optional[str] = settings.ibkr_default_account
-        
+
         # Connection state
         self._connected = False
         self._connecting = False
+
+        # Diagnostics: bounded history of IBKR errorEvents, keyed by reqId
+        # (== orderId for order-related errors) plus a small global ring.
+        # Populated by _on_error, read by _finalize_order_result / the
+        # get_connection_status tool. Never grows unbounded.
+        self._recent_errors: Dict[int, "collections.deque"] = {}
+        self._error_ring: "collections.deque" = collections.deque(maxlen=self._GLOBAL_ERROR_RING_SIZE)
     
     @property
     def is_paper(self) -> bool:
@@ -80,6 +102,7 @@ class IBKRClient:
             # Setup event handlers
             self.ib.disconnectedEvent += self._on_disconnect
             self.ib.errorEvent += self._on_error
+            self.ib.orderStatusEvent += self._on_order_status
 
             # Wait for connection to stabilize
             await asyncio.sleep(2)
@@ -119,13 +142,85 @@ class IBKRClient:
         asyncio.create_task(self._reconnect())
     
     def _on_error(self, reqId, errorCode, errorString, contract):
-        """Centralized error logging."""
+        """Centralized error logging.
+
+        Also feeds the bounded error rings (2026-09-08 incident fix) so a
+        rejection reason survives long enough for _finalize_order_result /
+        get_connection_status to attach it to a result instead of it being
+        logged once and lost. reqId is the orderId for order-related errors.
+        """
+        entry = {"ts": time.time(), "code": errorCode, "message": errorString}
+        try:
+            symbol = getattr(contract, "symbol", None)
+        except Exception:
+            symbol = None
+
+        self._error_ring.append({**entry, "req_id": reqId, "symbol": symbol})
+        if reqId:
+            bucket = self._recent_errors.setdefault(
+                int(reqId), collections.deque(maxlen=self._PER_ORDER_ERROR_RING_SIZE)
+            )
+            bucket.append(entry)
+
         # Don't log certain routine messages as errors
         if errorCode in [2104, 2106, 2158]:  # Market data warnings
             self.logger.debug(f"IBKR Info {errorCode}: {errorString}")
         else:
-            self.logger.error(f"IBKR Error {errorCode}: {errorString} (reqId: {reqId})")
-    
+            self.logger.warning(f"IBKR error reqId={reqId} code={errorCode}: {errorString}")
+
+    def _on_order_status(self, trade):
+        """Log every orderStatus transition IBKR reports (INFO). Best-effort
+        — a logging failure here must never break the ib_async event loop."""
+        try:
+            o = trade.order
+            st = trade.orderStatus
+            self.logger.info(
+                f"OrderStatus: order_id={o.orderId} symbol={trade.contract.symbol} "
+                f"status={st.status} filled={st.filled} remaining={st.remaining}"
+            )
+        except Exception:
+            pass
+
+    def _order_errors(self, order_id: Optional[int]) -> List[Dict]:
+        """Recent errorEvents recorded against `order_id`, oldest first."""
+        if not order_id:
+            return []
+        return [dict(e) for e in self._recent_errors.get(int(order_id), [])]
+
+    @staticmethod
+    def _last_error_str(errors: List[Dict]) -> Optional[str]:
+        if not errors:
+            return None
+        last = errors[-1]
+        return f"{last['code']}: {last['message']}"
+
+    def get_recent_errors(self, limit: int = 20) -> List[Dict]:
+        """Last `limit` IBKR errorEvents across all requests/orders, oldest
+        first. Exposed via get_connection_status for at-a-glance diagnostics
+        without needing to tail the log file."""
+        items = list(self._error_ring)
+        return items[-limit:] if limit else items
+
+    async def _finalize_order_result(self, trade, extra_wait: float = 1.5,
+                                      watch_for_reject: bool = True):
+        """Return (status, ibkr_errors, last_error) for a just-placed/modified
+        trade, giving a synchronous IBKR-side reject a brief extra window to
+        arrive as an errorEvent before we give up and return a bare status.
+
+        Only waits when `watch_for_reject` is set AND the status already
+        looks like a reject AND nothing has been captured for this order yet
+        — a deliberate cancel_order() call ending in "Cancelled" must not pay
+        this wait (pass watch_for_reject=False there).
+        """
+        order_id = int(getattr(trade.order, "orderId", 0) or 0)
+        status = trade.orderStatus.status
+        if (watch_for_reject and status in self._REJECT_STATUSES
+                and not self._recent_errors.get(order_id)):
+            await asyncio.sleep(extra_wait)
+            status = trade.orderStatus.status
+        errors = self._order_errors(order_id)
+        return status, errors, self._last_error_str(errors)
+
     async def _reconnect(self):
         """Background reconnection task."""
         try:
@@ -632,6 +727,10 @@ class IBKRClient:
             order.account = account or self.current_account
 
         trade = self.ib.placeOrder(contract, order)
+        self.logger.info(
+            f"Order placed: LMT {action} {int(quantity)} {symbol.upper()} "
+            f"tif={tif} outsideRth={bool(outside_rth)} order_id={trade.order.orderId}"
+        )
         await asyncio.sleep(1.0)  # let IBKR echo initial status (also lets permId arrive)
 
         # Persist (perm_id, order_id) -> orderRef so get_todays_fills can recover
@@ -639,6 +738,11 @@ class IBKRClient:
         # (2026-06-23 manual-exit null-tag fix). Best-effort; never blocks.
         order_ref_cache.record(trade.order.permId, trade.order.orderId,
                                order_ref, order.account)
+
+        # Diagnostics: give a synchronous IBKR reject a brief extra window to
+        # arrive as an errorEvent before we return a bare "Cancelled"/"Inactive"
+        # status with no reason attached (2026-09-08 PLTR incident).
+        status, ibkr_errors, last_error = await self._finalize_order_result(trade)
 
         return {
             "order_id":    trade.order.orderId,
@@ -651,10 +755,12 @@ class IBKRClient:
             "outside_rth": bool(outside_rth),
             "oca_group":   getattr(trade.order, "ocaGroup", "") or None,
             "oca_type":    getattr(trade.order, "ocaType", 0) or 0,
-            "status":      trade.orderStatus.status,
+            "status":      status,
             "filled":      safe_float(trade.orderStatus.filled),
             "remaining":   safe_float(trade.orderStatus.remaining),
             "account":     order.account,
+            "ibkr_errors": ibkr_errors,
+            "last_error":  last_error,
         }
 
     @retry_on_transient(max_attempts=2, delay=5.0)
@@ -707,11 +813,17 @@ class IBKRClient:
             order.account = account or self.current_account
 
         trade = self.ib.placeOrder(contract, order)
+        self.logger.info(
+            f"Order placed: STP {action} {int(quantity)} {symbol.upper()} "
+            f"tif={tif.upper()} outsideRth={bool(outside_rth)} order_id={trade.order.orderId}"
+        )
         await asyncio.sleep(1.0)
 
         # Persist tag for cross-client fill recovery (see place_limit_order).
         order_ref_cache.record(trade.order.permId, trade.order.orderId,
                                order_ref, order.account)
+
+        status, ibkr_errors, last_error = await self._finalize_order_result(trade)
 
         return {
             "order_id":    trade.order.orderId,
@@ -727,10 +839,12 @@ class IBKRClient:
             "tif":         tif.upper(),
             "outside_rth": bool(outside_rth),
             "transmit":    bool(transmit),
-            "status":      trade.orderStatus.status,
+            "status":      status,
             "filled":      safe_float(trade.orderStatus.filled),
             "remaining":   safe_float(trade.orderStatus.remaining),
             "account":     order.account,
+            "ibkr_errors": ibkr_errors,
+            "last_error":  last_error,
         }
 
     @retry_on_transient(max_attempts=2, delay=5.0)
@@ -798,6 +912,11 @@ class IBKRClient:
             parent.account = account or self.current_account
 
         parent_trade = self.ib.placeOrder(contract, parent)
+        self.logger.info(
+            f"Order placed: LMT (bracket parent) {parent_action} {int(parent_quantity)} "
+            f"{symbol.upper()} tif={parent_tif.upper()} outsideRth={bool(parent_outside_rth)} "
+            f"order_id={parent_trade.order.orderId}"
+        )
         # Tiny settle so IBKR assigns the orderId we'll reference.
         await asyncio.sleep(0.3)
         parent_order_id = parent_trade.order.orderId
@@ -805,6 +924,7 @@ class IBKRClient:
             raise IBKRConnectionError("IBKR did not assign orderId to parent")
 
         child_results = []
+        child_trades = []
         n = len(children)
         try:
             for i, c in enumerate(children):
@@ -849,6 +969,11 @@ class IBKRClient:
                     child.account = account or self.current_account
 
                 trade = self.ib.placeOrder(contract, child)
+                self.logger.info(
+                    f"Order placed: {ot} (bracket child) {action} {qty} {symbol.upper()} "
+                    f"tif={tif} outsideRth={outside_rth} order_id={trade.order.orderId}"
+                )
+                child_trades.append(trade)
                 child_results.append({
                     "order_id":   trade.order.orderId,
                     "perm_id":    trade.order.permId,
@@ -885,6 +1010,27 @@ class IBKRClient:
             order_ref_cache.record(cr.get("perm_id"), cr.get("order_id"),
                                    cr.get("tag"), parent.account)
 
+        # Diagnostics: one shared extra settle wait (not per-leg) covering the
+        # whole bracket, so a synchronous reject on the parent OR any child
+        # gets its errorEvent attached instead of a bare status.
+        def _needs_settle(trade) -> bool:
+            oid = int(getattr(trade.order, "orderId", 0) or 0)
+            return (trade.orderStatus.status in self._REJECT_STATUSES
+                    and not self._recent_errors.get(oid))
+
+        if _needs_settle(parent_trade) or any(_needs_settle(t) for t in child_trades):
+            await asyncio.sleep(1.5)
+
+        parent_id = int(getattr(parent_trade.order, "orderId", 0) or 0)
+        parent_errors = self._order_errors(parent_id)
+
+        for cr, ct in zip(child_results, child_trades):
+            cid = int(getattr(ct.order, "orderId", 0) or 0)
+            c_errors = self._order_errors(cid)
+            cr["status"] = ct.orderStatus.status
+            cr["ibkr_errors"] = c_errors
+            cr["last_error"] = self._last_error_str(c_errors)
+
         return {
             "parent": {
                 "order_id":    parent_trade.order.orderId,
@@ -897,6 +1043,8 @@ class IBKRClient:
                 "tif":         parent_tif.upper(),
                 "outside_rth": bool(parent_outside_rth),
                 "status":      parent_trade.orderStatus.status,
+                "ibkr_errors": parent_errors,
+                "last_error":  self._last_error_str(parent_errors),
             },
             "children":  child_results,
             "oca_group": oca_group,
@@ -942,7 +1090,17 @@ class IBKRClient:
 
         # Re-submit modified order with the same orderId — IBKR replaces it.
         trade = self.ib.placeOrder(target.contract, target.order)
+        self.logger.info(
+            f"Order modify resubmit: order_id={oid} symbol={target.contract.symbol} "
+            f"quantity={quantity} limit_price={limit_price} stop_price={stop_price}"
+        )
         await asyncio.sleep(0.5)
+
+        # A modify resubmit ending in Cancelled/Inactive is a genuine reject
+        # (unlike cancel_order, where that status is the intended outcome) —
+        # give it the same brief settle window as a fresh placement.
+        status, ibkr_errors, last_error = await self._finalize_order_result(trade)
+
         return {
             "order_id":   oid,
             "perm_id":    trade.order.permId,
@@ -954,7 +1112,9 @@ class IBKRClient:
                 "limit_price": safe_float(getattr(trade.order, "lmtPrice", 0)),
                 "stop_price":  safe_float(getattr(trade.order, "auxPrice", 0)),
             },
-            "status":     trade.orderStatus.status,
+            "status":      status,
+            "ibkr_errors": ibkr_errors,
+            "last_error":  last_error,
         }
 
     @rate_limit(calls_per_second=1.0)
@@ -1003,12 +1163,20 @@ class IBKRClient:
         for trade in self.ib.trades():
             if trade.order.orderId == int(order_id):
                 self.ib.cancelOrder(trade.order)
+                self.logger.info(f"Cancel requested: order_id={order_id} symbol={trade.contract.symbol}")
                 await asyncio.sleep(0.5)
+                # watch_for_reject=False: "Cancelled" here is the outcome we
+                # asked for, not a mystery reject — no extra settle wait.
+                status, ibkr_errors, last_error = await self._finalize_order_result(
+                    trade, watch_for_reject=False
+                )
                 return {
                     "order_id": order_id,
                     "symbol": trade.contract.symbol,
-                    "status": trade.orderStatus.status,
+                    "status": status,
                     "cancelled": True,
+                    "ibkr_errors": ibkr_errors,
+                    "last_error": last_error,
                 }
         return {"order_id": order_id, "cancelled": False, "error": "Order not found"}
 

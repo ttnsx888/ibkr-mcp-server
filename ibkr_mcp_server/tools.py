@@ -725,7 +725,11 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 "client_id": ibkr_client.client_id,
                 "current_account": ibkr_client.current_account,
                 "available_accounts": ibkr_client.accounts,
-                "paper_trading": ibkr_client.is_paper
+                "paper_trading": ibkr_client.is_paper,
+                # Diagnostics (2026-09-08 PLTR incident): last 20 IBKR
+                # errorEvents across all requests/orders, so a rejection
+                # reason is visible without tailing the log file.
+                "recent_ibkr_errors": ibkr_client.get_recent_errors(20),
             }
             return [TextContent(
                 type="text",

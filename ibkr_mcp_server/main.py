@@ -2,8 +2,11 @@
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional
 
 import click
@@ -17,6 +20,32 @@ from .tools import server
 
 
 console = Console()
+
+# Diagnostics (2026-09-08 PLTR incident): the server previously logged
+# nothing to disk at all, so an IBKR rejection reason that scrolled past in
+# stderr was gone for good. Default destination for the rotating diagnostics
+# log; IBKR_MCP_LOG_FILE overrides it, and an explicit empty value disables
+# file logging entirely (stderr-only).
+DEFAULT_LOG_DIR = Path.home() / ".trader" / "logs"
+DEFAULT_LOG_FILE = str(DEFAULT_LOG_DIR / "ibkr_mcp_server.log")
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 3
+
+
+def _resolve_log_file(explicit: Optional[str] = None) -> Optional[str]:
+    """Resolve the diagnostics log file path.
+
+    `explicit` (e.g. an explicit --log-file flag) wins when given. Otherwise
+    IBKR_MCP_LOG_FILE wins when set — including an explicit empty string,
+    which disables file logging entirely. With neither, use the default
+    path under ~/.trader/logs.
+    """
+    if explicit is not None:
+        return explicit
+    if "IBKR_MCP_LOG_FILE" in os.environ:
+        val = os.environ["IBKR_MCP_LOG_FILE"].strip()
+        return val or None
+    return DEFAULT_LOG_FILE
 
 
 class GracefulKiller:
@@ -37,10 +66,16 @@ class GracefulKiller:
 def setup_logging(level: str = "INFO", log_file: Optional[str] = None, mcp_mode: bool = False):
     """Setup logging configuration."""
     handlers = []
-    
-    # Always add file handler if specified
+
+    # Always add file handler if specified. Rotating (5MB x 3) so a chatty
+    # session can't grow this unbounded; the parent dir is created on demand
+    # (~/.trader/logs doesn't exist until the first run).
     if log_file:
-        file_handler = logging.FileHandler(log_file)
+        log_path = Path(log_file).expanduser()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_path, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+        )
         file_handler.setFormatter(
             logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         )
@@ -132,10 +167,12 @@ async def run_server():
 @click.command()
 @click.option('--test', is_flag=True, help='Test connection and exit')
 @click.option('--log-level', default=settings.log_level, help='Logging level')
-@click.option('--log-file', default=settings.log_file, help='Log file path')
-def cli(test: bool, log_level: str, log_file: str):
+@click.option('--log-file', default=None,
+              help=f'Log file path (default: {DEFAULT_LOG_FILE}; overridden by '
+                   'env IBKR_MCP_LOG_FILE, empty string disables file logging)')
+def cli(test: bool, log_level: str, log_file: Optional[str]):
     """IBKR MCP Server - Interactive Brokers integration for Claude."""
-    setup_logging(log_level, log_file, mcp_mode=not test)
+    setup_logging(log_level, _resolve_log_file(log_file), mcp_mode=not test)
     
     if test:
         # Run connection test
@@ -148,7 +185,7 @@ def cli(test: bool, log_level: str, log_file: str):
 
 async def main():
     """Main entry point when called as module."""
-    setup_logging(settings.log_level, settings.log_file, mcp_mode=True)
+    setup_logging(settings.log_level, _resolve_log_file(), mcp_mode=True)
     await run_server()
 
 

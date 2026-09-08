@@ -135,11 +135,38 @@ IBKR_IS_PAPER=true
 
 # Logging
 LOG_LEVEL=INFO
+IBKR_MCP_LOG_FILE=  # default: ~/.trader/logs/ibkr_mcp_server.log; set "" to disable file logging
 
 # Safety
 ENABLE_LIVE_TRADING=false  # Set to true for live trading
 MAX_ORDER_SIZE=1000  # Maximum order size
 ```
+
+## Diagnostics
+
+The server writes a rotating diagnostics log (INFO+, 5 MB x 3 backups) to
+`~/.trader/logs/ibkr_mcp_server.log` by default. Set `IBKR_MCP_LOG_FILE` to
+point it elsewhere, or to an empty string to disable file logging entirely
+(the server always logs to stderr too — never stdout, which the stdio MCP
+transport reserves for protocol frames). The log records every order
+placement, every orderStatus transition, and every IBKR `errorEvent`
+(reqId/code/message) at WARNING.
+
+Because IBKR reports order rejections asynchronously via `errorEvent`
+rather than as an exception from `placeOrder`, a placement can come back
+with a bare status like `Cancelled` or `Inactive` and no attached reason.
+To fix that, every tool result that reports an order status —
+`stage_order`/`confirm_order`, `stage_stop_order`, `stage_bracket_order`,
+`modify_live_order`, and order cancellation — carries two additional keys
+alongside `status`:
+
+- `ibkr_errors`: a list of `{code, message, ts}` objects — every
+  `errorEvent` IBKR fired for that specific order (empty list if none).
+- `last_error`: `"<code>: <message>"` for the most recent one, or `null`.
+
+`get_connection_status` also exposes `recent_ibkr_errors`: the last 20
+`errorEvent`s across all orders/requests, for an at-a-glance check without
+tailing the log file.
 
 ### TWS/Gateway Setup
 1. Start TWS or IB Gateway
