@@ -18,7 +18,8 @@ from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float,
 # ---------------------------------------------------------------------------
 # IBKR delivers an execution in two messages: execDetails first, then a
 # separate CommissionReport for the same execId (which is where `commission`
-# AND `realizedPNL` — the broker's own FIFO-matched per-execution P&L — live).
+# AND `realizedPNL` live — TWS's own AVERAGE-COST realized P&L per execution,
+# NOT the FIFO figure from the Flex statement; see the field comment below).
 # reqExecutionsAsync() returns as soon as execDetailsEnd arrives, so reading
 # commissionReport off the returned Fill objects immediately yields the
 # zero-valued default (382/385 rows in the live ledger had commission 0.0).
@@ -1487,11 +1488,14 @@ class IBKRClient:
                 # defaults (0.0 / "") rather than leaking the 1.8e308 sentinel.
                 "commission": _clean_double(getattr(comm, "commission", 0.0)) or 0.0,
                 "commission_currency": getattr(comm, "currency", "") or "",
-                # New: IBKR's own per-execution realized P&L, computed with the
-                # account's lot-matching method (FIFO here). None when the
-                # report never arrived or IBKR sent no value (e.g. opening
-                # trades, which have no realized P&L).
-                "realized_pnl_broker": (
+                # TWS's own per-execution realized P&L (CommissionReport.realizedPNL),
+                # computed AVERAGE-COST, not FIFO — confirmed 2026-09-09 on a
+                # META SELL 50: 5378.095 == (640 - 532.4207) * 50 - 0.869 exactly.
+                # `fifo_pnl_realized` (from the Flex statement) is the canonical
+                # realized figure; this is TWS's own number, kept for reference.
+                # None when the report never arrived or IBKR sent no value (e.g.
+                # opening trades, which have no realized P&L).
+                "realized_pnl_tws": (
                     _clean_double(getattr(comm, "realizedPNL", None)) if comm_received else None
                 ),
                 "commission_report_received": comm_received,

@@ -109,7 +109,7 @@ async def test_commission_report_arrives_on_second_poll(fills_client):
     row = rows[0]
     assert row["commission"] == 1.07
     assert row["commission_currency"] == "USD"
-    assert row["realized_pnl_broker"] == 214.55
+    assert row["realized_pnl_tws"] == 214.55
     assert row["commission_report_received"] is True
     # Existing keys untouched.
     assert row["exec_id"] == "e-late"
@@ -138,7 +138,7 @@ async def test_missing_commission_report_times_out_within_bound(fills_client):
     assert elapsed >= wait_s * 0.5
     row = rows[0]
     assert row["commission_report_received"] is False
-    assert row["realized_pnl_broker"] is None
+    assert row["realized_pnl_tws"] is None
     assert row["commission"] == 0.0
     assert row["commission_currency"] == ""
 
@@ -163,7 +163,7 @@ async def test_already_settled_report_skips_the_wait(fills_client):
 
     assert elapsed < 1.0
     assert rows[0]["commission"] == 2.5
-    assert rows[0]["realized_pnl_broker"] == -30.0
+    assert rows[0]["realized_pnl_tws"] == -30.0
     assert rows[0]["commission_report_received"] is True
 
 
@@ -185,7 +185,7 @@ async def test_unset_double_realized_pnl_maps_to_none(fills_client):
 
     rows = await fills_client.get_todays_fills(commission_wait_s=0.0)
 
-    assert rows[0]["realized_pnl_broker"] is None
+    assert rows[0]["realized_pnl_tws"] is None
     assert rows[0]["commission"] == 0.0
     assert rows[0]["commission_report_received"] is True
 
