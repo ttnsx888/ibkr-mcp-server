@@ -13,6 +13,40 @@ from .config import settings
 from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
+# ---------------------------------------------------------------------------
+# Commission-report settling window (get_todays_fills)
+# ---------------------------------------------------------------------------
+# IBKR delivers an execution in two messages: execDetails first, then a
+# separate CommissionReport for the same execId (which is where `commission`
+# AND `realizedPNL` — the broker's own FIFO-matched per-execution P&L — live).
+# reqExecutionsAsync() returns as soon as execDetailsEnd arrives, so reading
+# commissionReport off the returned Fill objects immediately yields the
+# zero-valued default (382/385 rows in the live ledger had commission 0.0).
+#
+# We therefore wait a short, hard-bounded window for the reports to land.
+# The swing tick calls get_todays_fills on every 1H bar close and at 16:05 —
+# a hung call is strictly worse than a missing commission, so the wait is
+# capped and always returns.
+COMMISSION_WAIT_S = 2.5      # total wall-clock budget for the settle window
+COMMISSION_POLL_S = 0.25     # re-check cadence inside that budget
+
+# ib_async's sentinel for "IBKR sent no value for this field".
+UNSET_DOUBLE = 1.7976931348623157e308
+
+
+def _clean_double(value):
+    """Return a float, or None when the value is missing/UNSET."""
+    if value is None:
+        return None
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    if f >= UNSET_DOUBLE or f != f:  # UNSET sentinel or NaN
+        return None
+    return f
+
+
 class IBKRClient:
     """Enhanced IBKR client with multi-account and short selling support."""
 
@@ -1180,8 +1214,107 @@ class IBKRClient:
                 }
         return {"order_id": order_id, "cancelled": False, "error": "Order not found"}
 
+    async def _await_commission_reports(
+        self,
+        exec_ids,
+        wait_s: float = COMMISSION_WAIT_S,
+        poll_s: float = COMMISSION_POLL_S,
+    ) -> Dict[str, object]:
+        """Wait (bounded) for CommissionReports for `exec_ids`; return execId -> report.
+
+        WHY POLL ``ib.fills()`` RATHER THAN THE OBJECTS reqExecutions RETURNED
+        --------------------------------------------------------------------
+        In ib_async's ``Wrapper.execDetails`` every execDetails message builds a
+        NEW ``Fill(contract, execution, CommissionReport(), time)`` and appends
+        that object to ``self._results[reqId]`` — i.e. to the list
+        reqExecutionsAsync() hands back — but only stores it in
+        ``self.fills[execId]`` the *first* time that execId is seen. When the
+        commission report later arrives, ``Wrapper.commissionReport`` looks up
+        ``self.fills[execId]`` and mutates *that* fill's report in place
+        (``dataclassUpdate(fill.commissionReport, commissionReport)``).
+
+        So the returned list and the canonical registry are the same objects
+        only for executions seen for the first time in this process. On any
+        re-request within the same session (the swing tick calls this once per
+        1H bar) the returned Fill is a fresh copy carrying an empty
+        CommissionReport while the updated one sits in ``ib.fills()``. Keying
+        off ``ib.fills()`` by execId is therefore the correct source, and it is
+        also what makes the in-place updates visible without re-requesting.
+
+        Secondary source: ``ib.commissionReportEvent`` subscribers collected for
+        the duration of the wait. That event only fires when the execution's
+        permId is in ``permId2Trade`` (i.e. an order this process knows about),
+        so it cannot replace the registry poll for cross-client fills — but it
+        costs nothing and covers any case where the registry lookup misses.
+
+        A default ``CommissionReport()`` has ``execId == ""``; a delivered one
+        always carries the execId, so a non-empty execId is the reliable
+        "report received" test (commission itself can legitimately be 0.0).
+        """
+        wanted = {str(e) for e in exec_ids if e}
+        if not wanted:
+            return {}
+
+        collected: Dict[str, object] = {}
+
+        def _on_commission_report(trade, fill, report):  # pragma: no cover - event path
+            try:
+                exec_id = str(getattr(report, "execId", "") or "")
+                if exec_id:
+                    collected[exec_id] = report
+            except Exception:
+                pass
+
+        subscribed = False
+        try:
+            self.ib.commissionReportEvent += _on_commission_report
+            subscribed = True
+        except Exception:
+            pass
+
+        def _snapshot() -> Dict[str, object]:
+            found: Dict[str, object] = dict(collected)
+            try:
+                for f in self.ib.fills():
+                    try:
+                        exec_id = str(getattr(f.execution, "execId", "") or "")
+                    except Exception:
+                        continue
+                    if exec_id not in wanted:
+                        continue
+                    report = getattr(f, "commissionReport", None)
+                    if report is not None and str(getattr(report, "execId", "") or ""):
+                        found[exec_id] = report
+            except Exception:
+                pass
+            return {k: v for k, v in found.items() if k in wanted}
+
+        try:
+            deadline = time.monotonic() + max(0.0, float(wait_s))
+            reports = _snapshot()
+            while len(reports) < len(wanted) and time.monotonic() < deadline:
+                await asyncio.sleep(max(0.01, float(poll_s)))
+                reports = _snapshot()
+            missing = len(wanted) - len(reports)
+            if missing:
+                self.logger.debug(
+                    f"get_todays_fills: {missing}/{len(wanted)} commission reports "
+                    f"still missing after {wait_s}s settle window"
+                )
+            return reports
+        finally:
+            if subscribed:
+                try:
+                    self.ib.commissionReportEvent -= _on_commission_report
+                except Exception:
+                    pass
+
     @rate_limit(calls_per_second=1.0)
-    async def get_todays_fills(self, account: Optional[str] = None) -> List[Dict]:
+    async def get_todays_fills(
+        self,
+        account: Optional[str] = None,
+        commission_wait_s: float = COMMISSION_WAIT_S,
+    ) -> List[Dict]:
         """Return today's executed fills from TWS.
 
         Uses ib.reqExecutionsAsync() which queries TWS's execution history for the
@@ -1200,6 +1333,9 @@ class IBKRClient:
         Args:
             account: optional account filter. If None, returns fills for all
                      accounts visible on this connection.
+            commission_wait_s: hard cap (seconds) on the CommissionReport settle
+                     window. Defaults to COMMISSION_WAIT_S (2.5s). Pass 0 to
+                     skip the wait entirely.
 
         Returns a list of dicts with fields aligned to the scan report's
         `filled_orders[]` schema. `tag`, `order_ref`, and `source` are aliases for
@@ -1266,6 +1402,35 @@ class IBKRClient:
 
         fills = await self.ib.reqExecutionsAsync(filt)
 
+        # reqExecutionsAsync returns at execDetailsEnd; the CommissionReport for
+        # each execId (commission + broker realizedPNL) arrives on a separate
+        # message right after. Give it a bounded window to land, then read the
+        # canonical registry copy. See _await_commission_reports for why the
+        # registry — not the objects returned above — is the source of truth.
+        # Only executions whose returned Fill has no report yet are worth
+        # waiting on. On a first sighting the returned object IS the registry
+        # object (see execDetails), so an already-populated report needs no
+        # settle window at all; on a re-request the returned copy is empty and
+        # the registry lookup below resolves it on the first poll.
+        batch_exec_ids = []
+        try:
+            for f in fills:
+                exec_id = str(getattr(f.execution, "execId", "") or "")
+                report = getattr(f, "commissionReport", None)
+                if exec_id and not str(getattr(report, "execId", "") or ""):
+                    batch_exec_ids.append(exec_id)
+        except Exception:
+            batch_exec_ids = []
+        commission_reports: Dict[str, object] = {}
+        if batch_exec_ids and (commission_wait_s or 0) >= 0:
+            try:
+                commission_reports = await self._await_commission_reports(
+                    batch_exec_ids, wait_s=commission_wait_s
+                )
+            except Exception as exc:  # never block fills retrieval on this
+                self.logger.debug(f"get_todays_fills: commission wait failed: {exc}")
+                commission_reports = {}
+
         # Tier-4 fallback source: placement-time (perm_id|order_id) -> orderRef
         # written to disk by every place_*_order call. Recovers the tag for a
         # fill whose order was placed by a different client_id (e.g.
@@ -1281,7 +1446,11 @@ class IBKRClient:
         for f in fills:
             execution = f.execution
             contract = f.contract
-            comm = f.commissionReport
+            exec_id = str(getattr(execution, "execId", "") or "")
+            # Prefer the settled registry/event report; fall back to whatever
+            # the returned Fill carries (identical object on first sighting).
+            comm = commission_reports.get(exec_id) or f.commissionReport
+            comm_received = bool(str(getattr(comm, "execId", "") or ""))
 
             # Map IBKR side codes ("BOT"/"SLD") to the action verbs the scan
             # report uses so downstream consumers don't need to translate.
@@ -1313,8 +1482,19 @@ class IBKRClient:
                 "fill_price": safe_float(execution.price),
                 "avg_price": safe_float(getattr(execution, "avgPrice", 0)) or safe_float(execution.price),
                 "time": execution.time.isoformat() if execution.time else None,
-                "commission": safe_float(getattr(comm, "commission", 0)),
-                "commission_currency": getattr(comm, "currency", ""),
+                # Existing keys — shape unchanged for the swing-monitor skill
+                # and the dashboard. UNSET/None collapse to the historical
+                # defaults (0.0 / "") rather than leaking the 1.8e308 sentinel.
+                "commission": _clean_double(getattr(comm, "commission", 0.0)) or 0.0,
+                "commission_currency": getattr(comm, "currency", "") or "",
+                # New: IBKR's own per-execution realized P&L, computed with the
+                # account's lot-matching method (FIFO here). None when the
+                # report never arrived or IBKR sent no value (e.g. opening
+                # trades, which have no realized P&L).
+                "realized_pnl_broker": (
+                    _clean_double(getattr(comm, "realizedPNL", None)) if comm_received else None
+                ),
+                "commission_report_received": comm_received,
                 "account": execution.acctNumber,
                 "exchange": execution.exchange,
                 "order_ref": order_ref or None,
