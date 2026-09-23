@@ -1170,6 +1170,9 @@ class IBKRClient:
                 "perm_id":    t.order.permId,
                 "parent_id":  int(getattr(t.order, "parentId", 0) or 0),
                 "symbol":     t.contract.symbol,
+                # Added 2026-09-22 (same rationale as get_todays_fills):
+                # distinguishes option orders from stock orders.
+                "secType":    getattr(t.contract, "secType", "") or "",
                 "action":     t.order.action,
                 "quantity":   safe_float(t.order.totalQuantity),
                 "limit_price": safe_float(getattr(t.order, "lmtPrice", 0)),
@@ -1483,6 +1486,17 @@ class IBKRClient:
                 "fill_price": safe_float(execution.price),
                 "avg_price": safe_float(getattr(execution, "avgPrice", 0)) or safe_float(execution.price),
                 "time": execution.time.isoformat() if execution.time else None,
+                # Added 2026-09-22 so consumers can separate option fills
+                # (short NVDA puts leaked into swing perf as 1-share stock
+                # sells). getattr with defaults so mocks without these
+                # attrs don't crash.
+                "secType": getattr(contract, "secType", "") or "",
+                "conid": str(getattr(contract, "conId", None)) if getattr(contract, "conId", None) else None,
+                "local_symbol": getattr(contract, "localSymbol", "") or None,
+                "right": getattr(contract, "right", "") or None,
+                "strike": safe_float(getattr(contract, "strike", 0)) or None,
+                "expiry": getattr(contract, "lastTradeDateOrContractMonth", "") or None,
+                "multiplier": getattr(contract, "multiplier", "") or None,
                 # Existing keys — shape unchanged for the swing-monitor skill
                 # and the dashboard. UNSET/None collapse to the historical
                 # defaults (0.0 / "") rather than leaking the 1.8e308 sentinel.
@@ -1509,10 +1523,19 @@ class IBKRClient:
 
     def _serialize_position(self, position) -> Dict:
         """Convert Position to serializable dict."""
+        contract = position.contract
         return {
-            "symbol": position.contract.symbol,
-            "secType": position.contract.secType,
-            "exchange": position.contract.exchange,
+            "symbol": contract.symbol,
+            "secType": contract.secType,
+            # Added 2026-09-22 (same as get_todays_fills) so option positions
+            # are distinguishable from stock positions downstream.
+            "conid": str(getattr(contract, "conId", None)) if getattr(contract, "conId", None) else None,
+            "local_symbol": getattr(contract, "localSymbol", "") or None,
+            "right": getattr(contract, "right", "") or None,
+            "strike": safe_float(getattr(contract, "strike", 0)) or None,
+            "expiry": getattr(contract, "lastTradeDateOrContractMonth", "") or None,
+            "multiplier": getattr(contract, "multiplier", "") or None,
+            "exchange": contract.exchange,
             "position": safe_float(position.position),
             "avgCost": safe_float(position.avgCost),
             "marketPrice": safe_float(getattr(position, 'marketPrice', 0)),

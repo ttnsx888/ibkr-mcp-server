@@ -319,3 +319,142 @@ class TestIBKRClient:
 
         assert fills[0]["symbol"] == "FOO"
         assert fills[0]["tag"] is None                 # NOT "SWING_FOREIGN_TAG"
+
+    @pytest.mark.asyncio
+    async def test_get_todays_fills_stk_vs_opt_contract_fields(self, ibkr_client_mock):
+        """2026-09-22: option fills (e.g. short NVDA puts) must carry secType
+        "OPT" plus right/strike/expiry/multiplier/conid/local_symbol so they
+        can be separated from stock fills instead of leaking into swing perf
+        as 1-share stock sells. A plain STK fill gets secType "STK" and None
+        for the option-only fields."""
+        from datetime import datetime
+
+        def _exec(*, exec_id, order_id, perm_id, symbol, side, qty, price):
+            execution = MagicMock()
+            execution.execId = exec_id
+            execution.orderId = order_id
+            execution.permId = perm_id
+            execution.side = side
+            execution.shares = qty
+            execution.price = price
+            execution.avgPrice = price
+            execution.time = datetime(2026, 9, 22, 10, 0, 0)
+            execution.acctNumber = "U4022128"
+            execution.exchange = "SMART"
+            execution.orderRef = ""
+            return execution
+
+        comm = MagicMock()
+        comm.commission = 1.0
+        comm.currency = "USD"
+
+        # STK contract — mimics ib_insync's Stock(), whose option-only fields
+        # (right/strike/multiplier) come back as empty strings, not None.
+        stk_contract = MagicMock()
+        stk_contract.symbol = "AAPL"
+        stk_contract.secType = "STK"
+        stk_contract.conId = 265598
+        stk_contract.localSymbol = "AAPL"
+        stk_contract.right = ""
+        stk_contract.strike = 0.0
+        stk_contract.lastTradeDateOrContractMonth = ""
+        stk_contract.multiplier = ""
+
+        stk_fill = MagicMock()
+        stk_fill.execution = _exec(exec_id="s1", order_id=1, perm_id=1,
+                                    symbol="AAPL", side="BOT", qty=100, price=230.0)
+        stk_fill.contract = stk_contract
+        stk_fill.commissionReport = comm
+
+        # OPT contract — short NVDA put.
+        opt_contract = MagicMock()
+        opt_contract.symbol = "NVDA"
+        opt_contract.secType = "OPT"
+        opt_contract.conId = 778899
+        opt_contract.localSymbol = "NVDA  261016P00120000"
+        opt_contract.right = "P"
+        opt_contract.strike = 120.0
+        opt_contract.lastTradeDateOrContractMonth = "20261016"
+        opt_contract.multiplier = "100"
+
+        opt_fill = MagicMock()
+        opt_fill.execution = _exec(exec_id="o1", order_id=2, perm_id=2,
+                                    symbol="NVDA", side="SLD", qty=1, price=3.5)
+        opt_fill.contract = opt_contract
+        opt_fill.commissionReport = comm
+
+        ibkr_client_mock.ib.trades.return_value = []
+        ibkr_client_mock.ib.reqExecutionsAsync = AsyncMock(
+            return_value=[stk_fill, opt_fill])
+
+        fills = await ibkr_client_mock.get_todays_fills()
+        by_symbol = {f["symbol"]: f for f in fills}
+
+        stk = by_symbol["AAPL"]
+        assert stk["secType"] == "STK"
+        assert stk["conid"] == "265598"
+        assert stk["local_symbol"] == "AAPL"
+        assert stk["right"] is None
+        assert stk["strike"] is None
+        assert stk["expiry"] is None
+        assert stk["multiplier"] is None
+
+        opt = by_symbol["NVDA"]
+        assert opt["secType"] == "OPT"
+        assert opt["conid"] == "778899"
+        assert opt["local_symbol"] == "NVDA  261016P00120000"
+        assert opt["right"] == "P"
+        assert opt["strike"] == 120.0
+        assert opt["expiry"] == "20261016"
+        assert opt["multiplier"] == "100"
+
+    def test_serialize_position_stk_vs_opt_contract_fields(self, ibkr_client_mock):
+        """_serialize_position mirrors get_todays_fills' option-vs-stock
+        contract fields (2026-09-22) — same rationale, positions side."""
+        stk_contract = MagicMock()
+        stk_contract.symbol = "AAPL"
+        stk_contract.secType = "STK"
+        stk_contract.conId = 265598
+        stk_contract.localSymbol = "AAPL"
+        stk_contract.right = ""
+        stk_contract.strike = 0.0
+        stk_contract.lastTradeDateOrContractMonth = ""
+        stk_contract.multiplier = ""
+        stk_contract.exchange = "SMART"
+
+        stk_position = MagicMock()
+        stk_position.contract = stk_contract
+        stk_position.position = 100
+        stk_position.avgCost = 230.0
+        stk_position.account = "U4022128"
+
+        opt_contract = MagicMock()
+        opt_contract.symbol = "NVDA"
+        opt_contract.secType = "OPT"
+        opt_contract.conId = 778899
+        opt_contract.localSymbol = "NVDA  261016P00120000"
+        opt_contract.right = "P"
+        opt_contract.strike = 120.0
+        opt_contract.lastTradeDateOrContractMonth = "20261016"
+        opt_contract.multiplier = "100"
+        opt_contract.exchange = "SMART"
+
+        opt_position = MagicMock()
+        opt_position.contract = opt_contract
+        opt_position.position = -1
+        opt_position.avgCost = 350.0
+        opt_position.account = "U4022128"
+
+        stk = ibkr_client_mock._serialize_position(stk_position)
+        assert stk["secType"] == "STK"
+        assert stk["conid"] == "265598"
+        assert stk["right"] is None
+        assert stk["strike"] is None
+        assert stk["multiplier"] is None
+
+        opt = ibkr_client_mock._serialize_position(opt_position)
+        assert opt["secType"] == "OPT"
+        assert opt["conid"] == "778899"
+        assert opt["right"] == "P"
+        assert opt["strike"] == 120.0
+        assert opt["multiplier"] == "100"
