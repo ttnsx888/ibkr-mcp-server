@@ -7,7 +7,7 @@ import time
 from typing import Dict, List, Optional, Union
 from decimal import Decimal
 
-from ib_async import IB, Stock, LimitOrder, StopOrder, Order, ExecutionFilter, util
+from ib_async import IB, Stock, Option, Contract, LimitOrder, StopOrder, Order, ExecutionFilter, util
 from . import order_ref_cache
 from .config import settings
 from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
@@ -701,6 +701,285 @@ class IBKRClient:
 
         return results
 
+    # -----------------------------------------------------------------------
+    # Options (2026-09-23). Additive — no existing stock method is touched.
+    # -----------------------------------------------------------------------
+
+    async def qualify_option(self, conid: Optional[int] = None,
+                              symbol: Optional[str] = None,
+                              expiry: Optional[str] = None,
+                              strike: Optional[float] = None,
+                              right: Optional[str] = None):
+        """Qualify a single option contract. `conid` takes precedence over
+        symbol/expiry/strike/right. Raises ValidationError on ambiguity or
+        failure to resolve — never returns a partially-qualified contract.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        if conid:
+            contract = Contract(conId=int(conid), exchange='SMART', currency='USD')
+            spec = f"conid={conid}"
+        else:
+            if not (symbol and expiry and strike is not None and right):
+                raise ValidationError(
+                    "qualify_option requires either conid, or symbol+expiry+strike+right")
+            right_u = str(right).upper()
+            if right_u == "CALL":
+                right_u = "C"
+            elif right_u == "PUT":
+                right_u = "P"
+            if right_u not in ("C", "P"):
+                raise ValidationError(f"right must be C/CALL or P/PUT, got {right!r}")
+            contract = Option(symbol.upper(), str(expiry), float(strike), right_u,
+                               'SMART', currency='USD')
+            spec = f"{symbol.upper()} {expiry} {strike}{right_u}"
+
+        details = await self.ib.reqContractDetailsAsync(contract)
+        if not details:
+            raise ValidationError(f"Could not qualify option contract for {spec}")
+        if len(details) > 1:
+            raise ValidationError(
+                f"Ambiguous option contract for {spec}: {len(details)} matches — "
+                "narrow the spec (pass conid).")
+
+        qualified = details[0].contract
+        if qualified.secType != "OPT":
+            raise ValidationError(
+                f"Resolved contract for {spec} is not an option (secType={qualified.secType})")
+        if not qualified.exchange:
+            qualified.exchange = "SMART"
+        if not qualified.currency:
+            qualified.currency = "USD"
+        return qualified
+
+    @rate_limit(calls_per_second=1.0)
+    async def get_option_chain(self, symbol: str) -> Dict:
+        """Option chain (expirations, strikes, trading class, multiplier) for
+        `symbol`'s underlying, preferring the SMART-routed row."""
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        stock = Stock(symbol.upper(), 'SMART', 'USD')
+        qualified = await self.ib.reqContractDetailsAsync(stock)
+        if not qualified:
+            return {"symbol": symbol.upper(), "error": "Contract not found"}
+        qualified_stock = qualified[0].contract
+
+        try:
+            chains = await self.ib.reqSecDefOptParamsAsync(
+                symbol.upper(), '', 'STK', qualified_stock.conId)
+        except Exception as e:
+            self.logger.warning(f"reqSecDefOptParamsAsync failed for {symbol}: {e}")
+            return {"symbol": symbol.upper(), "error": f"option chain lookup failed: {e}"}
+        if not chains:
+            return {"symbol": symbol.upper(), "error": "No option chain data"}
+
+        chain = next((c for c in chains if getattr(c, "exchange", "") == "SMART"), chains[0])
+
+        return {
+            "symbol": symbol.upper(),
+            "expirations": sorted(chain.expirations),
+            "strikes": sorted(chain.strikes),
+            "trading_class": chain.tradingClass,
+            "multiplier": chain.multiplier,
+        }
+
+    async def get_option_quote(self, **contract_spec) -> Dict:
+        """Snapshot option quote (bid/ask/last/mid + Greeks). Mirrors get_quote's
+        live→delayed fallback. Never raises just because market data is missing
+        (no OPRA subscription is a normal, expected case) — returns
+        source="none" plus any IBKR error codes observed during the request
+        window (e.g. 354/10089/10090/10167).
+        """
+        try:
+            contract = await self.qualify_option(**contract_spec)
+        except ValidationError as e:
+            return {"error": str(e)}
+
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        def _valid(v):
+            return v is not None and not (isinstance(v, float) and v != v) and v > 0
+
+        async def _snapshot(mode_label: str):
+            start_ts = time.time()
+            ticker = self.ib.reqMktData(contract, '', False, False)
+            greeks = None
+            for _ in range(8):  # ~4s @ 0.5s cadence
+                await asyncio.sleep(0.5)
+                greeks = (ticker.modelGreeks or ticker.bidGreeks or
+                          ticker.askGreeks or ticker.lastGreeks)
+                if (_valid(ticker.bid) and _valid(ticker.ask)) or greeks is not None:
+                    break
+            try:
+                self.ib.cancelMktData(contract)
+            except Exception:
+                pass
+            codes = sorted({
+                e["code"] for e in self._error_ring
+                if e["ts"] >= start_ts and e.get("symbol") == contract.symbol
+            })
+            return ticker, greeks, mode_label, codes
+
+        try:
+            self.ib.reqMarketDataType(1)  # live
+        except Exception:
+            pass
+        ticker, greeks, source, errors = await _snapshot("live")
+
+        got_anything = (_valid(ticker.bid) or _valid(ticker.ask) or
+                         _valid(ticker.last) or greeks is not None)
+        if not got_anything:
+            try:
+                self.ib.reqMarketDataType(3)  # delayed
+            except Exception:
+                pass
+            ticker, greeks, source, errors2 = await _snapshot("delayed")
+            errors = sorted(set(errors) | set(errors2))
+            got_anything = (_valid(ticker.bid) or _valid(ticker.ask) or
+                             _valid(ticker.last) or greeks is not None)
+
+        bid = safe_float(ticker.bid) if _valid(ticker.bid) else None
+        ask = safe_float(ticker.ask) if _valid(ticker.ask) else None
+        last = safe_float(ticker.last) if _valid(ticker.last) else None
+        mid = round((bid + ask) / 2, 4) if (bid is not None and ask is not None) else None
+
+        def _greek(field):
+            if greeks is None:
+                return None
+            return _clean_double(getattr(greeks, field, None))
+
+        return {
+            "conid": contract.conId,
+            "local_symbol": contract.localSymbol or None,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "mid": mid,
+            "delta": _greek("delta"),
+            "gamma": _greek("gamma"),
+            "theta": _greek("theta"),
+            "vega": _greek("vega"),
+            "iv": _greek("impliedVol"),
+            "und_price": _greek("undPrice"),
+            "source": source if got_anything else "none",
+            "errors": errors,
+        }
+
+    @retry_on_transient(max_attempts=2, delay=5.0)
+    async def whatif_option_order(self, contract, action: str, quantity: int,
+                                   limit_price: float) -> Dict:
+        """Margin-impact preview via ib.whatIfOrderAsync — never places a real
+        order. `contract` must already be qualified (e.g. via qualify_option)."""
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        order = LimitOrder(action=action.upper(), totalQuantity=int(quantity),
+                            lmtPrice=round(float(limit_price), 2))
+        try:
+            state = await self.ib.whatIfOrderAsync(contract, order)
+        except Exception as e:
+            self.logger.warning(f"whatif_option_order failed: {e}")
+            return {
+                "init_margin_change": None, "maint_margin_change": None,
+                "equity_with_loan_after": None, "commission_est": None,
+                "error": str(e),
+            }
+        if state is None:
+            return {
+                "init_margin_change": None, "maint_margin_change": None,
+                "equity_with_loan_after": None, "commission_est": None,
+                "error": "whatIfOrderAsync returned no result",
+            }
+        return {
+            "init_margin_change":     _clean_double(getattr(state, "initMarginChange", None)),
+            "maint_margin_change":    _clean_double(getattr(state, "maintMarginChange", None)),
+            "equity_with_loan_after": _clean_double(getattr(state, "equityWithLoanAfter", None)),
+            "commission_est":         _clean_double(getattr(state, "commission", None)),
+        }
+
+    @rate_limit(calls_per_second=0.5)
+    @retry_on_transient(max_attempts=2, delay=5.0)
+    async def place_option_limit_order(self, contract, action: str, quantity: int,
+                                        limit_price: float, tif: str = "DAY",
+                                        order_ref: str = "",
+                                        account: Optional[str] = None) -> Dict:
+        """Submit an option LMT order. Mirrors place_limit_order (logging,
+        account, orderRef, order_ref_cache recording, return shape) but
+        outsideRth is ALWAYS False, tif is DAY or GTC only, quantity is
+        contracts (int >= 1), and limit_price is rounded to 2dp (accepts the
+        0.01 penny-pilot tick; IBKR itself enforces the exact tick table).
+        `contract` must already be qualified (e.g. via qualify_option) — this
+        method does not build a fresh Option() from a bare symbol.
+        """
+        if not await self._ensure_connected():
+            raise IBKRConnectionError("Not connected to IBKR")
+
+        action = action.upper()
+        if action not in ("BUY", "SELL"):
+            raise ValidationError(f"Invalid action: {action}")
+        tif = (tif or "DAY").upper()
+        if tif not in ("DAY", "GTC"):
+            raise ValidationError(f"Option orders only support tif DAY or GTC (got {tif!r})")
+        qty = int(quantity)
+        if qty < 1:
+            raise ValidationError("quantity (contracts) must be >= 1")
+        price = round(float(limit_price), 2)
+        if price <= 0:
+            raise ValidationError("limit_price must be positive")
+        if not getattr(contract, "conId", 0):
+            raise ValidationError("contract must already be qualified (conId missing) — "
+                                   "call qualify_option first")
+
+        order = LimitOrder(
+            action=action,
+            totalQuantity=qty,
+            lmtPrice=price,
+            tif=tif,
+            outsideRth=False,
+            orderRef=str(order_ref or ""),
+        )
+        if account or self.current_account:
+            order.account = account or self.current_account
+
+        trade = self.ib.placeOrder(contract, order)
+        self.logger.info(
+            f"Order placed: OPT LMT {action} {qty} "
+            f"{contract.localSymbol or contract.symbol} tif={tif} "
+            f"order_id={trade.order.orderId}"
+        )
+        await asyncio.sleep(1.0)
+
+        order_ref_cache.record(trade.order.permId, trade.order.orderId,
+                               order_ref, order.account)
+
+        status, ibkr_errors, last_error = await self._finalize_order_result(trade)
+
+        return {
+            "order_id":     trade.order.orderId,
+            "perm_id":      trade.order.permId,
+            "symbol":       contract.symbol,
+            "local_symbol": contract.localSymbol or None,
+            "conid":        contract.conId,
+            "right":        getattr(contract, "right", "") or None,
+            "strike":       safe_float(getattr(contract, "strike", 0)) or None,
+            "expiry":       getattr(contract, "lastTradeDateOrContractMonth", "") or None,
+            "multiplier":   getattr(contract, "multiplier", "") or None,
+            "action":       action,
+            "quantity":     qty,
+            "limit_price":  price,
+            "tif":          tif,
+            "outside_rth":  False,
+            "status":       status,
+            "filled":       safe_float(trade.orderStatus.filled),
+            "remaining":    safe_float(trade.orderStatus.remaining),
+            "account":      order.account,
+            "ibkr_errors":  ibkr_errors,
+            "last_error":   last_error,
+        }
+
     @rate_limit(calls_per_second=0.5)
     @retry_on_transient(max_attempts=2, delay=5.0)
     async def place_limit_order(self, symbol: str, action: str, quantity: int,
@@ -1173,6 +1452,13 @@ class IBKRClient:
                 # Added 2026-09-22 (same rationale as get_todays_fills):
                 # distinguishes option orders from stock orders.
                 "secType":    getattr(t.contract, "secType", "") or "",
+                # Added 2026-09-23 (OPT support): same contract fields as
+                # get_todays_fills / _serialize_position, additive for STK.
+                "conid":      str(getattr(t.contract, "conId", None)) if getattr(t.contract, "conId", None) else None,
+                "right":      getattr(t.contract, "right", "") or None,
+                "strike":     safe_float(getattr(t.contract, "strike", 0)) or None,
+                "expiry":     getattr(t.contract, "lastTradeDateOrContractMonth", "") or None,
+                "multiplier": getattr(t.contract, "multiplier", "") or None,
                 "action":     t.order.action,
                 "quantity":   safe_float(t.order.totalQuantity),
                 "limit_price": safe_float(getattr(t.order, "lmtPrice", 0)),

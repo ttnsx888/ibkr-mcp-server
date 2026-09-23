@@ -11,8 +11,9 @@ from dataclasses import asdict
 
 from .client import ibkr_client
 from .config import settings
+from .option_gates import check_option_order
 from .orders import StagedOrder, staged_store
-from .utils import validate_symbol, validate_symbols, IBKRError
+from .utils import safe_float, validate_symbol, validate_symbols, IBKRError
 
 
 LIVE_PORTS = {7496, 4001}
@@ -280,6 +281,69 @@ async def _validate_order_inputs(symbol: str, action: str, quantity: int,
                          f"(max {effective_max*100:.0f}%, source={source}). Refusing."}
     return {"ok": True, "reference_price": ref, "drift_pct": round(drift * 100, 2),
             "reference_source": source}
+
+
+def _option_contract_spec(arguments: dict) -> dict:
+    """Build qualify_option()/get_option_quote() kwargs from tool arguments:
+    conid (preferred, if present) OR symbol+expiry+strike+right. Raises
+    ValueError with a caller-friendly message when neither is fully given."""
+    conid = arguments.get("conid")
+    if conid:
+        return {"conid": int(conid)}
+    symbol = arguments.get("symbol")
+    expiry = arguments.get("expiry")
+    strike = arguments.get("strike")
+    right = arguments.get("right")
+    if not (symbol and expiry and strike is not None and right):
+        raise ValueError("Must provide conid, or symbol+expiry+strike+right")
+    return {
+        "symbol": validate_symbol(symbol),
+        "expiry": str(expiry),
+        "strike": float(strike),
+        "right": right,
+    }
+
+
+def _contract_dict(contract) -> dict:
+    """The {conid, right, strike, multiplier, symbol} shape option_gates expects,
+    built from a qualified ib_async contract."""
+    return {
+        "conid": contract.conId,
+        "right": getattr(contract, "right", None) or None,
+        "strike": safe_float(getattr(contract, "strike", 0)) or None,
+        "multiplier": getattr(contract, "multiplier", None) or 100,
+        "symbol": contract.symbol,
+    }
+
+
+async def _run_option_gates(intent: str, action: str, quantity: int, limit_price: float,
+                            contract, allow_no_quote: bool):
+    """Fetch fresh positions/open-orders/quote/whatif state and run
+    check_option_order. Shared by stage_option_order and the confirm_order
+    OPT dispatch so both paths validate against the exact same rules."""
+    contract_dict = _contract_dict(contract)
+    positions = await ibkr_client.get_portfolio()
+    open_orders = await ibkr_client.get_open_trades()
+    try:
+        quote = await ibkr_client.get_option_quote(conid=contract.conId)
+    except Exception as e:
+        quote = {"error": str(e)}
+    whatif = None
+    if intent.upper() == "STO" and (contract_dict.get("right") or "").upper() == "P":
+        try:
+            whatif = await ibkr_client.whatif_option_order(
+                contract, "SELL", quantity, limit_price)
+        except Exception as e:
+            whatif = {"error": str(e)}
+    try:
+        funds = await _funds_snapshot(None)
+    except Exception:
+        funds = {}
+    return check_option_order(
+        intent=intent, action=action, qty=quantity, limit_price=limit_price,
+        contract=contract_dict, positions=positions, open_orders=open_orders,
+        quote=quote, whatif=whatif, funds=funds, allow_no_quote=allow_no_quote,
+    )
 
 
 # Create the server instance
@@ -605,6 +669,78 @@ TOOLS = [
             "required": ["order_id"],
             "additionalProperties": False
         }
+    ),
+    Tool(
+        name="get_option_chain",
+        description=(
+            "Get the option chain (expirations, strikes, trading class, "
+            "multiplier) for a symbol's underlying, preferring the SMART-"
+            "routed row."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="get_option_quote",
+        description=(
+            "Snapshot option quote: bid/ask/last/mid plus Greeks "
+            "(delta/gamma/theta/vega/iv) and underlying price. Identify the "
+            "contract by `conid`, or by symbol+expiry+strike+right. Never "
+            "fails just because market data is unavailable (no OPRA "
+            "subscription is a normal case) — returns source='none' with any "
+            "observed IBKR error codes (e.g. 354/10089/10090/10167)."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "conid":  {"type": "integer",
+                            "description": "IBKR contract id — takes precedence over symbol/expiry/strike/right."},
+                "symbol": {"type": "string"},
+                "expiry": {"type": "string", "description": "YYYYMMDD"},
+                "strike": {"type": "number"},
+                "right":  {"type": "string", "enum": ["C", "P", "CALL", "PUT"]}
+            },
+            "additionalProperties": False
+        }
+    ),
+    Tool(
+        name="stage_option_order",
+        description=(
+            "Validate and stage an OPTION order for later approval. Does NOT "
+            "submit to IBKR. Identify the contract by `conid`, or by "
+            "symbol+expiry+strike+right. `intent` classifies the trade: BTC "
+            "(buy to close a short), STC (sell to close a long), or STO "
+            "(sell to open — put or COVERED call only; naked calls and "
+            "BTO/opening-long are refused). Runs option_gates.check_option_order "
+            "against current positions/open orders/quote/whatif margin impact; "
+            "re-run at confirm_order time against fresh state."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "conid":         {"type": "integer"},
+                "symbol":        {"type": "string"},
+                "expiry":        {"type": "string", "description": "YYYYMMDD"},
+                "strike":        {"type": "number"},
+                "right":         {"type": "string", "enum": ["C", "P", "CALL", "PUT"]},
+                "intent":        {"type": "string", "enum": ["BTC", "STC", "STO"]},
+                "action":        {"type": "string", "enum": ["BUY", "SELL"]},
+                "quantity":      {"type": "integer", "minimum": 1,
+                                    "description": "Number of contracts."},
+                "limit_price":   {"type": "number", "exclusiveMinimum": 0},
+                "tif":           {"type": "string", "enum": ["DAY", "GTC"], "default": "DAY"},
+                "source":        {"type": "string", "description": "Provenance tag, e.g. 'WHEEL_BTC_...'"},
+                "order_ref":     {"type": "string", "description": "Alias for `source`."},
+                "allow_no_quote": {"type": "boolean", "default": False,
+                                    "description": "Skip the price-sanity check (as a warning, not a refusal) when no usable bid/ask is available."}
+            },
+            "required": ["intent", "action", "quantity", "limit_price"],
+            "additionalProperties": False
+        }
     )
 ]
 
@@ -823,6 +959,54 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     "error": (f"Live port {ibkr_client.port} detected but ENABLE_LIVE_TRADING=false. "
                               "Refusing to submit. Set ENABLE_LIVE_TRADING=true in .env to allow."),
                 }))]
+
+            # OPT dispatch (2026-09-23). Option orders skip the stock-only
+            # validators below (_validate_order_inputs' quote-drift check and
+            # _buy_funds_gate assume shares/notional) — option_gates covers
+            # price sanity and margin impact (via whatif) on its own terms.
+            # Re-run against FRESH state (positions/open orders/quote/whatif
+            # can all have moved since stage time), then place directly.
+            if getattr(order, "sec_type", "STK") == "OPT":
+                try:
+                    contract = await ibkr_client.qualify_option(conid=order.conid)
+                except Exception as e:
+                    return [TextContent(type="text", text=json.dumps({
+                        "submitted": False,
+                        "error": f"could not qualify option contract: {e}"}))]
+
+                ok, reasons, warnings = await _run_option_gates(
+                    intent=order.intent or "", action=order.action,
+                    quantity=order.quantity, limit_price=order.limit_price,
+                    contract=contract, allow_no_quote=False,
+                )
+                if not ok:
+                    return [TextContent(type="text", text=json.dumps({
+                        "submitted": False,
+                        "error": "; ".join(reasons),
+                        "reasons": reasons,
+                        "warnings": warnings,
+                    }))]
+
+                try:
+                    result = await ibkr_client.place_option_limit_order(
+                        contract=contract, action=order.action,
+                        quantity=order.quantity, limit_price=order.limit_price,
+                        tif=order.tif, order_ref=order.source,
+                    )
+                except Exception as e:
+                    return [TextContent(type="text", text=json.dumps({
+                        "submitted": False,
+                        "error": f"IBKR rejected order: {e}"}))]
+
+                staged_store.remove(staged_id)
+                return [TextContent(type="text", text=json.dumps({
+                    "submitted": True,
+                    "staged_id": staged_id,
+                    "warnings": warnings,
+                    "ibkr": result,
+                }, indent=2, default=str))]
+
+            # --- Stock path (unchanged below) ---
 
             # Re-validate against current market (strict — IBKR must be connected).
             # For STP/STP_LMT orders, validate drift against stop_price (the trigger),
@@ -1146,6 +1330,78 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                                     text=json.dumps({"error": str(e)}))]
             quotes = await ibkr_client.get_quotes(symbol_list)
             return [TextContent(type="text", text=json.dumps(quotes, indent=2))]
+
+        elif name == "get_option_chain":
+            symbol = validate_symbol(arguments["symbol"])
+            chain = await ibkr_client.get_option_chain(symbol)
+            return [TextContent(type="text", text=json.dumps(chain, indent=2))]
+
+        elif name == "get_option_quote":
+            try:
+                spec = _option_contract_spec(arguments)
+            except ValueError as e:
+                return [TextContent(type="text", text=json.dumps({"error": str(e)}))]
+            quote = await ibkr_client.get_option_quote(**spec)
+            return [TextContent(type="text", text=json.dumps(quote, indent=2))]
+
+        elif name == "stage_option_order":
+            try:
+                spec = _option_contract_spec(arguments)
+            except ValueError as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False, "error": str(e)}))]
+
+            intent = (arguments.get("intent") or "").upper()
+            action = (arguments.get("action") or "").upper()
+            quantity = int(arguments["quantity"])
+            limit_price = float(arguments["limit_price"])
+            tif = (arguments.get("tif") or "DAY").upper()
+            source = arguments.get("source") or arguments.get("order_ref") or ""
+            allow_no_quote = bool(arguments.get("allow_no_quote", False))
+
+            try:
+                contract = await ibkr_client.qualify_option(**spec)
+            except Exception as e:
+                return [TextContent(type="text", text=json.dumps({
+                    "staged": False,
+                    "error": f"could not qualify option contract: {e}"}))]
+
+            ok, reasons, warnings = await _run_option_gates(
+                intent=intent, action=action, quantity=quantity,
+                limit_price=limit_price, contract=contract,
+                allow_no_quote=allow_no_quote,
+            )
+            if not ok:
+                return [TextContent(type="text", text=json.dumps({
+                    "staged": False,
+                    "error": "; ".join(reasons),
+                    "reasons": reasons,
+                    "warnings": warnings,
+                }))]
+
+            try:
+                order = StagedOrder.new(
+                    symbol=contract.symbol, action=action, quantity=quantity,
+                    limit_price=limit_price, tif=tif, source=source,
+                    order_type="LMT",
+                    sec_type="OPT",
+                    conid=contract.conId,
+                    expiry=getattr(contract, "lastTradeDateOrContractMonth", None) or None,
+                    strike=safe_float(getattr(contract, "strike", 0)) or None,
+                    right=getattr(contract, "right", None) or None,
+                    multiplier=getattr(contract, "multiplier", None) or None,
+                    intent=intent,
+                )
+            except ValueError as e:
+                return [TextContent(type="text",
+                                    text=json.dumps({"staged": False, "error": str(e)}))]
+            staged_store.add(order)
+            return [TextContent(type="text", text=json.dumps({
+                "staged":    True,
+                "staged_id": order.id,
+                "summary":   order.summary(),
+                "warnings":  warnings,
+            }, indent=2))]
 
         else:
             return [TextContent(

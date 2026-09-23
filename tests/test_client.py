@@ -1,5 +1,7 @@
 """Tests for IBKR client functionality."""
 
+from types import SimpleNamespace
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -458,3 +460,350 @@ class TestIBKRClient:
         assert opt["right"] == "P"
         assert opt["strike"] == 120.0
         assert opt["multiplier"] == "100"
+
+
+class TestOptionSupport:
+    """2026-09-23: qualify_option / get_option_chain / get_option_quote /
+    place_option_limit_order / whatif_option_order, plus the additive OPT
+    fields on get_open_trades and the modify/cancel contract-reuse guarantee.
+    """
+
+    def _contract_details(self, *, conId=778899, secType="OPT", symbol="NVDA",
+                           right="P", strike=120.0, expiry="20261016",
+                           multiplier="100", exchange="SMART", currency="USD",
+                           localSymbol="NVDA  261016P00120000"):
+        contract = MagicMock()
+        contract.conId = conId
+        contract.secType = secType
+        contract.symbol = symbol
+        contract.right = right
+        contract.strike = strike
+        contract.lastTradeDateOrContractMonth = expiry
+        contract.multiplier = multiplier
+        contract.exchange = exchange
+        contract.currency = currency
+        contract.localSymbol = localSymbol
+        cd = MagicMock()
+        cd.contract = contract
+        return cd
+
+    # -- qualify_option -----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_qualify_option_by_conid(self, ibkr_client_mock):
+        cd = self._contract_details()
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[cd])
+
+        contract = await ibkr_client_mock.qualify_option(conid=778899)
+        assert contract.conId == 778899
+        assert contract.secType == "OPT"
+
+    @pytest.mark.asyncio
+    async def test_qualify_option_by_spec(self, ibkr_client_mock):
+        cd = self._contract_details()
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[cd])
+
+        contract = await ibkr_client_mock.qualify_option(
+            symbol="nvda", expiry="20261016", strike=120.0, right="put")
+        assert contract.conId == 778899
+        assert contract.right == "P"
+
+    @pytest.mark.asyncio
+    async def test_qualify_option_no_match_raises(self, ibkr_client_mock):
+        from ibkr_mcp_server.utils import ValidationError
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[])
+        with pytest.raises(ValidationError):
+            await ibkr_client_mock.qualify_option(conid=999999)
+
+    @pytest.mark.asyncio
+    async def test_qualify_option_ambiguous_raises(self, ibkr_client_mock):
+        from ibkr_mcp_server.utils import ValidationError
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(
+            return_value=[self._contract_details(), self._contract_details()])
+        with pytest.raises(ValidationError, match="Ambiguous"):
+            await ibkr_client_mock.qualify_option(
+                symbol="NVDA", expiry="20261016", strike=120.0, right="P")
+
+    @pytest.mark.asyncio
+    async def test_qualify_option_missing_spec_raises(self, ibkr_client_mock):
+        from ibkr_mcp_server.utils import ValidationError
+        with pytest.raises(ValidationError):
+            await ibkr_client_mock.qualify_option(symbol="NVDA")
+
+    @pytest.mark.asyncio
+    async def test_qualify_option_non_option_result_raises(self, ibkr_client_mock):
+        from ibkr_mcp_server.utils import ValidationError
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(
+            return_value=[self._contract_details(secType="STK")])
+        with pytest.raises(ValidationError):
+            await ibkr_client_mock.qualify_option(conid=778899)
+
+    # -- get_option_chain -----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_get_option_chain(self, ibkr_client_mock):
+        stock_cd = MagicMock()
+        stock_contract = MagicMock()
+        stock_contract.conId = 4815
+        stock_cd.contract = stock_contract
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[stock_cd])
+
+        smart_chain = SimpleNamespace(
+            exchange="SMART", underlyingConId=4815, tradingClass="NVDA",
+            multiplier="100", expirations={"20261016", "20261120"},
+            strikes={100.0, 110.0, 120.0})
+        other_chain = SimpleNamespace(
+            exchange="CBOE", underlyingConId=4815, tradingClass="NVDA",
+            multiplier="100", expirations={"20261016"}, strikes={100.0})
+        ibkr_client_mock.ib.reqSecDefOptParamsAsync = AsyncMock(
+            return_value=[other_chain, smart_chain])
+
+        chain = await ibkr_client_mock.get_option_chain("nvda")
+        assert chain["symbol"] == "NVDA"
+        assert chain["expirations"] == ["20261016", "20261120"]
+        assert chain["strikes"] == [100.0, 110.0, 120.0]
+        assert chain["trading_class"] == "NVDA"
+        assert chain["multiplier"] == "100"
+
+    @pytest.mark.asyncio
+    async def test_get_option_chain_no_underlying(self, ibkr_client_mock):
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[])
+        chain = await ibkr_client_mock.get_option_chain("BADSYM")
+        assert "error" in chain
+
+    # -- get_option_quote -----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_get_option_quote_returns_bid_ask_and_greeks(self, ibkr_client_mock):
+        cd = self._contract_details()
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[cd])
+
+        greeks = SimpleNamespace(delta=-0.32, gamma=0.01, theta=-0.05, vega=0.08,
+                                 impliedVol=0.45, undPrice=131.2)
+        ticker = MagicMock()
+        ticker.bid = 3.40
+        ticker.ask = 3.60
+        ticker.last = 3.50
+        ticker.modelGreeks = greeks
+        ticker.bidGreeks = None
+        ticker.askGreeks = None
+        ticker.lastGreeks = None
+        ibkr_client_mock.ib.reqMktData.return_value = ticker
+        ibkr_client_mock.ib.reqMarketDataType = MagicMock()
+        ibkr_client_mock.ib.cancelMktData = MagicMock()
+
+        quote = await ibkr_client_mock.get_option_quote(conid=778899)
+        assert quote["bid"] == 3.40
+        assert quote["ask"] == 3.60
+        assert quote["mid"] == 3.50
+        assert quote["delta"] == -0.32
+        assert quote["source"] == "live"
+        assert quote["errors"] == []
+
+    @pytest.mark.asyncio
+    async def test_get_option_quote_no_data_returns_source_none_not_raise(
+            self, ibkr_client_mock, monkeypatch):
+        # Both the live and delayed snapshot windows poll for ~4s each with no
+        # data ever arriving — fast-forward the sleeps (via a fake that still
+        # fires the errorEvent mid-window, matching how a real 10089 arrives
+        # asynchronously while the snapshot is polling) so this test doesn't
+        # burn ~8s of wall clock.
+        import ibkr_mcp_server.client as client_module
+
+        cd = self._contract_details()
+        ibkr_client_mock.ib.reqContractDetailsAsync = AsyncMock(return_value=[cd])
+
+        fired = {"done": False}
+
+        async def fake_sleep(*args, **kwargs):
+            if not fired["done"]:
+                fired["done"] = True
+                # Simulate IBKR emitting "no OPRA subscription" (10089) while
+                # the snapshot's poll window is open.
+                ibkr_client_mock._on_error(
+                    0, 10089, "Requested market data is not subscribed", cd.contract)
+
+        monkeypatch.setattr(client_module.asyncio, "sleep", fake_sleep)
+
+        ticker = MagicMock()
+        ticker.bid = None
+        ticker.ask = None
+        ticker.last = None
+        ticker.modelGreeks = None
+        ticker.bidGreeks = None
+        ticker.askGreeks = None
+        ticker.lastGreeks = None
+        ibkr_client_mock.ib.reqMktData.return_value = ticker
+        ibkr_client_mock.ib.reqMarketDataType = MagicMock()
+        ibkr_client_mock.ib.cancelMktData = MagicMock()
+
+        quote = await ibkr_client_mock.get_option_quote(conid=778899)
+        assert quote["source"] == "none"
+        assert quote["bid"] is None
+        assert 10089 in quote["errors"]
+
+    @pytest.mark.asyncio
+    async def test_get_option_quote_bad_spec_returns_error_dict_not_raise(self, ibkr_client_mock):
+        quote = await ibkr_client_mock.get_option_quote(symbol="NVDA")  # missing expiry/strike/right
+        assert "error" in quote
+
+    # -- whatif_option_order ----------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_whatif_option_order(self, ibkr_client_mock):
+        cd = self._contract_details()
+        contract = cd.contract
+        state = SimpleNamespace(initMarginChange=1500.0, maintMarginChange=1200.0,
+                                equityWithLoanAfter=98000.0, commission=0.65)
+        ibkr_client_mock.ib.whatIfOrderAsync = AsyncMock(return_value=state)
+
+        result = await ibkr_client_mock.whatif_option_order(contract, "SELL", 1, 3.50)
+        assert result["init_margin_change"] == 1500.0
+        assert result["maint_margin_change"] == 1200.0
+        assert result["equity_with_loan_after"] == 98000.0
+        assert result["commission_est"] == 0.65
+
+    @pytest.mark.asyncio
+    async def test_whatif_option_order_failure_returns_none_fields_not_raise(self, ibkr_client_mock):
+        cd = self._contract_details()
+        ibkr_client_mock.ib.whatIfOrderAsync = AsyncMock(side_effect=RuntimeError("boom"))
+
+        result = await ibkr_client_mock.whatif_option_order(cd.contract, "SELL", 1, 3.50)
+        assert result["init_margin_change"] is None
+        assert "error" in result
+
+    # -- place_option_limit_order ------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_place_option_limit_order_outside_rth_always_false(self, ibkr_client_mock):
+        cd = self._contract_details()
+        contract = cd.contract
+
+        order = SimpleNamespace(orderId=501, permId=90501, action="SELL",
+                                totalQuantity=1, lmtPrice=3.50, tif="DAY",
+                                outsideRth=False, orderRef="WHEEL_STO_1", account="U1")
+        status = SimpleNamespace(status="Submitted", filled=0, remaining=1)
+        trade = SimpleNamespace(order=order, orderStatus=status)
+        ibkr_client_mock.ib.placeOrder.return_value = trade
+
+        result = await ibkr_client_mock.place_option_limit_order(
+            contract=contract, action="sell", quantity=1, limit_price=3.499,
+            tif="day", order_ref="WHEEL_STO_1")
+
+        assert result["outside_rth"] is False
+        assert result["limit_price"] == 3.50   # rounded to 2dp
+        assert result["conid"] == 778899
+        assert result["right"] == "P"
+        placed_order = ibkr_client_mock.ib.placeOrder.call_args[0][1]
+        assert placed_order.outsideRth is False
+
+    @pytest.mark.asyncio
+    async def test_place_option_limit_order_rejects_bad_tif(self, ibkr_client_mock):
+        from ibkr_mcp_server.utils import ValidationError
+        cd = self._contract_details()
+        with pytest.raises(ValidationError):
+            await ibkr_client_mock.place_option_limit_order(
+                contract=cd.contract, action="SELL", quantity=1,
+                limit_price=3.50, tif="OPG")
+
+    @pytest.mark.asyncio
+    async def test_place_option_limit_order_requires_qualified_contract(self, ibkr_client_mock):
+        from ibkr_mcp_server.utils import ValidationError
+        unqualified = MagicMock()
+        unqualified.conId = 0
+        with pytest.raises(ValidationError):
+            await ibkr_client_mock.place_option_limit_order(
+                contract=unqualified, action="SELL", quantity=1, limit_price=3.50)
+
+    # -- get_open_trades: additive OPT fields --------------------------------
+
+    @pytest.mark.asyncio
+    async def test_get_open_trades_opt_additive_fields(self, ibkr_client_mock):
+        opt_order = SimpleNamespace(orderId=1, permId=1, parentId=0, action="SELL",
+                                    totalQuantity=1, lmtPrice=3.5, auxPrice=None,
+                                    orderType="LMT", ocaGroup="", ocaType=0, tif="DAY",
+                                    outsideRth=False, transmit=True, account="U1",
+                                    orderRef="TAG")
+        opt_status = SimpleNamespace(status="Submitted", filled=0, remaining=1)
+        opt_contract = self._contract_details().contract
+        opt_trade = SimpleNamespace(order=opt_order, orderStatus=opt_status,
+                                    contract=opt_contract)
+
+        stk_order = SimpleNamespace(orderId=2, permId=2, parentId=0, action="BUY",
+                                    totalQuantity=10, lmtPrice=230.0, auxPrice=None,
+                                    orderType="LMT", ocaGroup="", ocaType=0, tif="DAY",
+                                    outsideRth=False, transmit=True, account="U1",
+                                    orderRef="")
+        stk_status = SimpleNamespace(status="Submitted", filled=0, remaining=10)
+        stk_contract = MagicMock()
+        stk_contract.symbol = "AAPL"
+        stk_contract.secType = "STK"
+        stk_contract.conId = 265598
+        stk_contract.right = ""
+        stk_contract.strike = 0.0
+        stk_contract.lastTradeDateOrContractMonth = ""
+        stk_contract.multiplier = ""
+        stk_trade = SimpleNamespace(order=stk_order, orderStatus=stk_status,
+                                    contract=stk_contract)
+
+        ibkr_client_mock.ib.openTrades.return_value = [opt_trade, stk_trade]
+
+        trades = await ibkr_client_mock.get_open_trades()
+        by_id = {t["order_id"]: t for t in trades}
+
+        opt = by_id[1]
+        assert opt["secType"] == "OPT"
+        assert opt["conid"] == "778899"
+        assert opt["right"] == "P"
+        assert opt["strike"] == 120.0
+        assert opt["expiry"] == "20261016"
+        assert opt["multiplier"] == "100"
+
+        stk = by_id[2]
+        assert stk["secType"] == "STK"
+        assert stk["right"] is None
+        assert stk["strike"] is None
+        assert stk["expiry"] is None
+        assert stk["multiplier"] is None
+
+    # -- modify/cancel reuse trade.contract (never rebuild Stock()) --------
+
+    @pytest.mark.asyncio
+    async def test_modify_order_reuses_opt_trade_contract(self, ibkr_client_mock):
+        """modify_order must resubmit with the SAME contract object the trade
+        already carries — never a freshly-built Stock(symbol), which would be
+        wrong (and un-placeable) for an OPT trade."""
+        cd = self._contract_details()
+        opt_contract = cd.contract
+        order = SimpleNamespace(orderId=77, permId=907, totalQuantity=1,
+                                lmtPrice=3.50, auxPrice=None, account="U1",
+                                transmit=False)
+        status = SimpleNamespace(status="Submitted", filled=0, remaining=1)
+        trade = SimpleNamespace(order=order, orderStatus=status, contract=opt_contract)
+        ibkr_client_mock.ib.trades.return_value = [trade]
+        ibkr_client_mock.ib.placeOrder.return_value = trade
+
+        result = await ibkr_client_mock.modify_order(77, limit_price=3.75)
+
+        assert result["modified"] is True
+        placed_contract = ibkr_client_mock.ib.placeOrder.call_args[0][0]
+        assert placed_contract is opt_contract
+        assert placed_contract.secType == "OPT"
+
+    @pytest.mark.asyncio
+    async def test_cancel_order_reuses_opt_trade_no_rebuild(self, ibkr_client_mock):
+        """cancel_order must cancel the trade's own order — it never touches
+        contract construction at all, so an OPT trade cancels exactly like a
+        STK trade."""
+        cd = self._contract_details()
+        opt_contract = cd.contract
+        order = SimpleNamespace(orderId=88, permId=908)
+        status = SimpleNamespace(status="Submitted", filled=0, remaining=1)
+        trade = SimpleNamespace(order=order, orderStatus=status, contract=opt_contract)
+        ibkr_client_mock.ib.trades.return_value = [trade]
+
+        result = await ibkr_client_mock.cancel_order(88)
+
+        assert result["cancelled"] is True
+        assert result["symbol"] == "NVDA"
+        ibkr_client_mock.ib.cancelOrder.assert_called_once_with(order)

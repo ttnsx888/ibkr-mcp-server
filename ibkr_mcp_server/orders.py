@@ -64,6 +64,16 @@ class StagedOrder:
     oca_type: int = 0                       # 0=none, 1=cancel, 2=reduce_with_block, 3=reduce_no_block
     parent_staged_id: Optional[str] = None  # if set, this is a bracket child of that parent
     transmit_last: bool = True              # for bracket legs — only the final leg should be True
+    # 2026-09-23: OPTION support (additive). Loading an old staged-orders.json
+    # written before these fields existed must still work — dataclass defaults
+    # below cover that (StagedOrder(**v) simply omits the missing keys).
+    sec_type: str = "STK"                   # "STK" | "OPT"
+    conid: Optional[int] = None             # OPT: qualified contract id
+    expiry: Optional[str] = None            # OPT: lastTradeDateOrContractMonth (YYYYMMDD)
+    strike: Optional[float] = None          # OPT
+    right: Optional[str] = None             # OPT: "C" | "P"
+    multiplier: Optional[str] = None        # OPT: contract multiplier, e.g. "100"
+    intent: Optional[str] = None            # OPT: "BTC" | "STC" | "STO"
 
     @classmethod
     def new(cls, symbol: str, action: str, quantity: int,
@@ -75,7 +85,14 @@ class StagedOrder:
             oca_group: Optional[str] = None,
             oca_type: int = 0,
             parent_staged_id: Optional[str] = None,
-            transmit_last: bool = True) -> "StagedOrder":
+            transmit_last: bool = True,
+            sec_type: str = "STK",
+            conid: Optional[int] = None,
+            expiry: Optional[str] = None,
+            strike: Optional[float] = None,
+            right: Optional[str] = None,
+            multiplier: Optional[str] = None,
+            intent: Optional[str] = None) -> "StagedOrder":
         now = datetime.utcnow()
         ot = order_type.upper()
         if ot not in VALID_ORDER_TYPES:
@@ -123,6 +140,13 @@ class StagedOrder:
             oca_type=int(oca_type),
             parent_staged_id=parent_staged_id,
             transmit_last=bool(transmit_last),
+            sec_type=(sec_type or "STK").upper(),
+            conid=int(conid) if conid is not None else None,
+            expiry=expiry,
+            strike=float(strike) if strike is not None else None,
+            right=(right.upper() if right else None),
+            multiplier=multiplier,
+            intent=(intent.upper() if intent else None),
         )
 
     def is_expired(self) -> bool:
@@ -143,6 +167,12 @@ class StagedOrder:
             px = ot
         oca = f" oca={self.oca_group}" if self.oca_group else ""
         bracket = f" parent={self.parent_staged_id}" if self.parent_staged_id else ""
+        if self.sec_type == "OPT":
+            strike_s = f"{self.strike:g}" if self.strike is not None else "?"
+            contract_desc = f"{self.symbol} {self.expiry or '?'} {strike_s}{self.right or '?'}"
+            intent_tag = f" [{self.intent}]" if self.intent else ""
+            return (f"{self.action} {self.quantity}x {contract_desc} "
+                    f"{px} ({self.tif}{rth}){oca}{bracket}{intent_tag} — {self.source}")
         return (f"{self.action} {self.quantity} {self.symbol} "
                 f"{px} ({self.tif}{rth}){oca}{bracket} — {self.source}")
 
