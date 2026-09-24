@@ -878,6 +878,13 @@ class IBKRClient:
 
         order = LimitOrder(action=action.upper(), totalQuantity=int(quantity),
                             lmtPrice=round(float(limit_price), 2))
+        # Without an explicit TIF, TWS answers "Order TIF was set to DAY based
+        # on order preset" (10349) and the what-if OrderState comes back with
+        # every margin field empty; with a multi-account login the account
+        # must be set too (2026-09-24, AAPL 325P returned None → STO refused).
+        order.tif = "DAY"
+        if self.current_account:
+            order.account = self.current_account
         try:
             state = await self.ib.whatIfOrderAsync(contract, order)
         except Exception as e:

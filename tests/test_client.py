@@ -664,6 +664,23 @@ class TestOptionSupport:
         assert result["commission_est"] == 0.65
 
     @pytest.mark.asyncio
+    async def test_whatif_option_order_sets_tif_and_account(self, ibkr_client_mock):
+        # IBKR returns an empty OrderState for a what-if with no TIF (10349
+        # preset warning) or, on a multi-account login, no account.
+        cd = self._contract_details()
+        ibkr_client_mock.current_account = "U4022128"
+        state = SimpleNamespace(initMarginChange="369.24", maintMarginChange="369.25",
+                                equityWithLoanAfter="379238.0", commission=1.7976931348623157e308)
+        ibkr_client_mock.ib.whatIfOrderAsync = AsyncMock(return_value=state)
+
+        result = await ibkr_client_mock.whatif_option_order(cd.contract, "SELL", 1, 3.70)
+        sent_order = ibkr_client_mock.ib.whatIfOrderAsync.call_args[0][1]
+        assert sent_order.tif == "DAY"
+        assert sent_order.account == "U4022128"
+        assert result["init_margin_change"] == 369.24      # string from TWS parsed
+        assert result["commission_est"] is None             # UNSET sentinel dropped
+
+    @pytest.mark.asyncio
     async def test_whatif_option_order_failure_returns_none_fields_not_raise(self, ibkr_client_mock):
         cd = self._contract_details()
         ibkr_client_mock.ib.whatIfOrderAsync = AsyncMock(side_effect=RuntimeError("boom"))
