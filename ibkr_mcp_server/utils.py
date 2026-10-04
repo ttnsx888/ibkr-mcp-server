@@ -1,6 +1,7 @@
 """Utility functions for IBKR MCP Server."""
 
 import asyncio
+import contextvars
 import functools
 import logging
 import time
@@ -75,6 +76,24 @@ def retry_on_failure(max_attempts: int = 3, delay: float = 1.0, backoff: float =
     return decorator
 
 
+# Set by mark_order_sent() once an order has been handed to IBKR inside a
+# @retry_on_transient call; the retry wrapper then never re-runs that call
+# (a second run would transmit a DUPLICATE order).
+_order_sent: contextvars.ContextVar = contextvars.ContextVar("ibkr_order_sent", default=False)
+
+
+def mark_order_sent() -> None:
+    """Call immediately after ib.placeOrder() in an order-placement method.
+
+    From this point on, any exception raised by the method propagates
+    unchanged and is NOT retried by @retry_on_transient, however transient it
+    looks: the order is already at IBKR, so re-running the method would place
+    it a second time. Failures before this call (not connected, contract
+    lookup timeout) are still retried as before.
+    """
+    _order_sent.set(True)
+
+
 def retry_on_transient(max_attempts: int = 2, delay: float = 5.0, backoff: float = 1.5):
     """
     Selective retry decorator for order placement (audit M2).
@@ -107,10 +126,19 @@ def retry_on_transient(max_attempts: int = 2, delay: float = 5.0, backoff: float
         async def wrapper(*args, **kwargs):
             last_exception = None
             for attempt in range(max_attempts):
+                _order_sent.set(False)
                 try:
                     return await func(*args, **kwargs)
                 except Exception as e:
                     last_exception = e
+                    if _order_sent.get():
+                        # The order was already transmitted (mark_order_sent):
+                        # never retry — a re-run would send a duplicate.
+                        logger.error(
+                            f"{func.__name__} failed AFTER the order was sent "
+                            f"({type(e).__name__}: {e}) — not retried"
+                        )
+                        raise
                     if not _is_transient(e):
                         # Non-transient — surface immediately; retrying would
                         # just delay the same rejection.

@@ -262,6 +262,74 @@ def test_m2_retry_on_transient_decorator():
     print(f"  ✓ M2: retry_on_transient retries transient (1+1), skips non-transient (1), exhausts (2)")
 
 
+def test_retry_never_reruns_after_order_sent():
+    """Once mark_order_sent() ran inside the call, a transient-looking error
+    propagates unchanged and the call is NOT re-run (no duplicate order); the
+    marker is per attempt, so a pre-send failure is still retried."""
+    from ibkr_mcp_server.utils import retry_on_transient, mark_order_sent
+    import asyncio
+
+    sent = {"orders": 0, "calls": 0}
+
+    @retry_on_transient(max_attempts=3, delay=0.01)
+    async def fails_after_send():
+        sent["calls"] += 1
+        sent["orders"] += 1            # the placeOrder
+        mark_order_sent()
+        raise ConnectionError("connection reset / timeout while reading status")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(fails_after_send())
+        raise AssertionError("expected ConnectionError")
+    except ConnectionError as e:
+        assert "connection reset" in str(e)        # original exception, unchanged
+    assert sent == {"orders": 1, "calls": 1}, f"post-send failure was retried: {sent}"
+
+    # pre-send transient failure on attempt 1, then a send that fails afterwards
+    s2 = {"orders": 0, "calls": 0}
+
+    @retry_on_transient(max_attempts=3, delay=0.01)
+    async def presend_fail_then_send_fail():
+        s2["calls"] += 1
+        if s2["calls"] == 1:
+            raise asyncio.TimeoutError("not connected yet")   # before any send: retried
+        s2["orders"] += 1
+        mark_order_sent()
+        raise asyncio.TimeoutError("timed out after send")
+
+    try:
+        asyncio.get_event_loop().run_until_complete(presend_fail_then_send_fail())
+        raise AssertionError("expected TimeoutError")
+    except asyncio.TimeoutError:
+        pass
+    assert s2 == {"orders": 1, "calls": 2}, f"{s2}"
+
+    # a marker left over from an earlier call must not disable retries of the next one
+    s3 = {"calls": 0}
+
+    @retry_on_transient(max_attempts=2, delay=0.01)
+    async def plain_transient_then_ok():
+        s3["calls"] += 1
+        if s3["calls"] < 2:
+            raise ConnectionError("temporary disconnect")
+        return "ok"
+
+    assert asyncio.get_event_loop().run_until_complete(plain_transient_then_ok()) == "ok"
+    assert s3["calls"] == 2
+
+    # every order-placement method marks the send right after its first placeOrder
+    import inspect
+    from ibkr_mcp_server.client import IBKRClient
+    for name in ("place_limit_order", "place_option_limit_order", "place_stop_order",
+                 "place_bracket_order"):
+        src = inspect.getsource(inspect.unwrap(getattr(IBKRClient, name)))
+        lines = [ln.strip() for ln in src.splitlines()]
+        i = next(k for k, ln in enumerate(lines) if "self.ib.placeOrder(" in ln)
+        assert lines[i + 1].startswith("mark_order_sent()"), f"{name}: placeOrder not marked"
+
+    print("  ✓ retry_on_transient never re-runs a call after mark_order_sent()")
+
+
 def test_confirm_order_rejects_bracket_child():
     """Audit I3: confirming a bracket child's staged_id alone would orphan
     the parent + siblings. confirm_order must reject with a helpful error."""
@@ -312,6 +380,7 @@ if __name__ == "__main__":
         test_validation_rejects_negative_stop,
         test_modify_live_order_requires_a_field,
         test_m2_retry_on_transient_decorator,
+        test_retry_never_reruns_after_order_sent,
         test_confirm_order_rejects_bracket_child,
     ]
     failed = 0

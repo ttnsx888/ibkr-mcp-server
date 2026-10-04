@@ -10,7 +10,7 @@ from decimal import Decimal
 from ib_async import IB, Stock, Option, Contract, LimitOrder, StopOrder, Order, ExecutionFilter, util
 from . import order_ref_cache
 from .config import settings
-from .utils import rate_limit, retry_on_failure, retry_on_transient, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
+from .utils import mark_order_sent, rate_limit, retry_on_failure, retry_on_transient, safe_float, safe_int, ValidationError, ConnectionError as IBKRConnectionError
 
 
 # ---------------------------------------------------------------------------
@@ -952,6 +952,7 @@ class IBKRClient:
             order.account = account or self.current_account
 
         trade = self.ib.placeOrder(contract, order)
+        mark_order_sent()   # from here on: never retried (no duplicate order)
         self.logger.info(
             f"Order placed: OPT LMT {action} {qty} "
             f"{contract.localSymbol or contract.symbol} tif={tif} "
@@ -1048,6 +1049,7 @@ class IBKRClient:
             order.account = account or self.current_account
 
         trade = self.ib.placeOrder(contract, order)
+        mark_order_sent()   # from here on: never retried (no duplicate order)
         self.logger.info(
             f"Order placed: LMT {action} {int(quantity)} {symbol.upper()} "
             f"tif={tif} outsideRth={bool(outside_rth)} order_id={trade.order.orderId}"
@@ -1134,6 +1136,7 @@ class IBKRClient:
             order.account = account or self.current_account
 
         trade = self.ib.placeOrder(contract, order)
+        mark_order_sent()   # from here on: never retried (no duplicate order)
         self.logger.info(
             f"Order placed: STP {action} {int(quantity)} {symbol.upper()} "
             f"tif={tif.upper()} outsideRth={bool(outside_rth)} order_id={trade.order.orderId}"
@@ -1233,6 +1236,7 @@ class IBKRClient:
             parent.account = account or self.current_account
 
         parent_trade = self.ib.placeOrder(contract, parent)
+        mark_order_sent()   # from here on: never retried (no duplicate order)
         self.logger.info(
             f"Order placed: LMT (bracket parent) {parent_action} {int(parent_quantity)} "
             f"{symbol.upper()} tif={parent_tif.upper()} outsideRth={bool(parent_outside_rth)} "
