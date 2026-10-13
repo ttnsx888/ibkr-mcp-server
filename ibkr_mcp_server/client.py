@@ -775,14 +775,26 @@ class IBKRClient:
         if not chains:
             return {"symbol": symbol.upper(), "error": "No option chain data"}
 
-        chain = next((c for c in chains if getattr(c, "exchange", "") == "SMART"), chains[0])
+        # IBKR can return several SMART rows (one per tradingClass); taking just
+        # the first dropped listed weeklies for GOOG/AMD (2026-10-13: 20261113
+        # "not listed"). Union every standard (x100, non-adjusted) SMART row;
+        # adjusted classes ("2AMD"-style, odd multipliers) stay out because their
+        # expiries/strikes would qualify to non-standard contracts.
+        sym = symbol.upper()
+        smart = [c for c in chains if getattr(c, "exchange", "") == "SMART"]
+        standard = [c for c in smart
+                    if str(getattr(c, "multiplier", "")) == "100"
+                    and not str(getattr(c, "tradingClass", "") or "")[:1].isdigit()]
+        rows = standard or smart[:1] or chains[:1]
+        primary = next((c for c in rows if c.tradingClass == sym), rows[0])
 
         return {
-            "symbol": symbol.upper(),
-            "expirations": sorted(chain.expirations),
-            "strikes": sorted(chain.strikes),
-            "trading_class": chain.tradingClass,
-            "multiplier": chain.multiplier,
+            "symbol": sym,
+            "expirations": sorted(set().union(*(c.expirations for c in rows))),
+            "strikes": sorted(set().union(*(c.strikes for c in rows))),
+            "trading_class": primary.tradingClass,
+            "trading_classes": sorted({c.tradingClass for c in rows}),
+            "multiplier": primary.multiplier,
         }
 
     async def get_option_quote(self, **contract_spec) -> Dict:
