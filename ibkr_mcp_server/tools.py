@@ -147,7 +147,7 @@ def _open_buy_notional(account: "str | None") -> float:
 # On 2026-10-14 buying power on the margin account U4022128 fell from $97.6k to
 # $73.6k after manual buys and nothing stopped new bot entries (risk_guard only
 # pages). The rule lives in ONE place, the Trader repo's scripts/live/
-# margin_gate.py (line $75k, release $80k, margin account only, latch against
+# margin_gate.py (line $100k, release $105k, margin account only, latch against
 # chop around the line). It is loaded here by FILE PATH so this server needs no
 # install-time dependency on that repo; TRADER_DIR overrides the checkout.
 #
@@ -168,7 +168,7 @@ def _open_buy_notional(account: "str | None") -> float:
 # ---------------------------------------------------------------------------
 
 _MARGIN_GATE_ACCOUNT = "U4022128"
-_MARGIN_GATE_LINE_USD = 75000.0
+_MARGIN_GATE_LINE_USD = 100000.0   # fallback only; owner 2026-10-15 (was 75k)
 _MARGIN_GATE_RETRY_S = 60.0   # after a failed load, retry no sooner than this
 _MG_MODULE = None             # cached margin_gate module
 _MG_FAILED_AT: "float | None" = None

@@ -54,6 +54,9 @@ def _fresh_caches(monkeypatch, tmp_path):
     """Every test starts with no cached gate module, funds or quote snapshot, and
     the shared module's files (broker_state / latch) point at tmp_path."""
     monkeypatch.setenv("MARGIN_GATE_LIVE_DIR", str(tmp_path))
+    # Rule tests use the 2026-10-14 numbers against a $75k line; the shipped
+    # line is $100k (owner 2026-10-15) - see test_shipped_line_is_100k.
+    monkeypatch.setattr(tools, "_MARGIN_GATE_LINE_USD", 75000.0)
     monkeypatch.setattr(tools, "_MG_MODULE", None)
     monkeypatch.setattr(tools, "_MG_FAILED_AT", None)
     monkeypatch.setattr(tools, "_FUNDS_CACHE", {})
@@ -72,6 +75,9 @@ def real_gate(tmp_path, monkeypatch):
     assert mod is not None, "real margin_gate failed to load"
     monkeypatch.setattr(mod.C, "LIVE_DIR", tmp_path)
     monkeypatch.setenv("MARGIN_GATE_LIVE_DIR", str(tmp_path))  # never the live latch
+    orig = mod.gate_config
+    monkeypatch.setattr(mod, "gate_config", lambda *a, **k: {
+        **orig(*a, **k), "buying_power_crit_usd": 75000, "buying_power_clear_usd": 5000})
     return mod
 
 
@@ -836,3 +842,22 @@ class TestBurstLedger:
         body = await _confirm(ids[2])
         assert body["submitted"] is False
         assert body["error"] == _THIRD_REFUSAL
+
+
+def test_shipped_line_is_100k():
+    """Owner 2026-10-15: line raised $75k -> $100k (release $105k)."""
+    src = open(tools.__file__).read()
+    assert "_MARGIN_GATE_LINE_USD = 100000.0" in src
+    d = _real_trader_dir()
+    if d is None:
+        pytest.skip("Trader margin_gate.py not found")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("mg_shipped", Path(d) / "scripts" / "live" / "margin_gate.py")
+    mod = importlib.util.module_from_spec(spec)
+    saved = list(sys.path)
+    try:
+        spec.loader.exec_module(mod)
+    finally:
+        sys.path[:] = saved
+    g = mod.gate_config()
+    assert g["buying_power_crit_usd"] == 100000 and g["buying_power_clear_usd"] == 5000
