@@ -407,11 +407,34 @@ def _margin_gate_option_impact(whatif, bp, available_funds) -> float:
     return max(0.0, imc) * ratio
 
 
+def _configured_cash_accounts() -> frozenset:
+    """Normalised ids from settings.ibkr_cash_accounts (IBKR_CASH_ACCOUNTS)."""
+    raw = getattr(settings, "ibkr_cash_accounts", "") or ""
+    return frozenset(a for a in (_norm_account(p) for p in str(raw).split(",")) if a)
+
+
+def _is_cash_account(account, acct_type: str) -> bool:
+    """True when the §8h cumulative open-BUY deduction applies to `account`.
+
+    IBKR's AccountType tag describes ownership structure (INDIVIDUAL, JOINT,
+    IRA...), not cash vs margin: both live accounts read INDIVIDUAL (all 50
+    snapshots since 2026-07-31), so from 07-31 to 10-15 the tag never matched
+    "CASH" and the cash branch never ran. The account id in the configured cash
+    list is the authority; AccountType == "CASH" is kept as a second positive
+    signal. An account not in the list that reads INDIVIDUAL stays on the
+    margin path (2026-08-13 fix).
+    """
+    if str(acct_type or "").upper() == "CASH":
+        return True
+    return _norm_account(account) in _configured_cash_accounts()
+
+
 async def _buy_funds_gate(action: str, quantity: int, price: float,
                           strict: bool, margin_gate: bool = True) -> dict:
     """Refuse a BUY whose notional exceeds funds headroom.
 
-    CASH accounts: headroom = AvailableFunds (fallback TotalCashValue)
+    CASH accounts (settings.ibkr_cash_accounts, or AccountType == "CASH" —
+    see _is_cash_account): headroom = AvailableFunds (fallback TotalCashValue)
     − total open BUY notional. Cash is consumed dollar-for-dollar as
     resting BUYs fill, and IBKR parks over-committed cash-account BUYs
     Inactive instead of rejecting them (§8h), so the worst-case
@@ -451,8 +474,9 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
         return {"ok": True,
                 "warning": f"funds lookup failed ({e}) — will re-validate at confirm time"}
 
-    acct_type = str(snap.get("AccountType", "")).upper()
-    if acct_type == "CASH":
+    account = ibkr_client.current_account
+    is_cash = _is_cash_account(account, str(snap.get("AccountType", "")))
+    if is_cash:
         candidates = [("AvailableFunds", snap.get("AvailableFunds")),
                       ("TotalCashValue", snap.get("TotalCashValue"))]
     else:
@@ -470,10 +494,9 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
         return {"ok": True,
                 "warning": "no funds figure available — will re-validate at confirm time"}
 
-    account = ibkr_client.current_account
     notional = quantity * price
     open_buy = _open_buy_notional(account)
-    if acct_type == "CASH":
+    if is_cash:
         headroom = ceiling - open_buy
         if notional > headroom + 0.01:
             return {"ok": False, "error": (

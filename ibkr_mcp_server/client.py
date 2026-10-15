@@ -304,8 +304,10 @@ class IBKRClient:
                 'GrossPositionValue', 'BuyingPower', 'EquityWithLoanValue',
                 'PreviousDayEquityWithLoanValue', 'FullInitMarginReq', 'FullMaintMarginReq',
                 # Funds gate (tools._buy_funds_gate, 2026-07-31): AvailableFunds
-                # is the placement ceiling; SettledCash informs cash accounts;
-                # AccountType ("CASH" vs margin) picks the ceiling tag.
+                # is the placement ceiling; SettledCash informs cash accounts.
+                # AccountType is NOT a cash/margin discriminator (INDIVIDUAL for
+                # both live accounts); cash accounts come from
+                # settings.ibkr_cash_accounts (tools._is_cash_account).
                 'AvailableFunds', 'SettledCash', 'AccountType'
             ]
             

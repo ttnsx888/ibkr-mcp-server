@@ -13,7 +13,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from ibkr_mcp_server import tools
-from ibkr_mcp_server.tools import _buy_funds_gate, _open_buy_notional
+from ibkr_mcp_server.config import Settings
+from ibkr_mcp_server.tools import (_buy_funds_gate, _is_cash_account,
+                                   _open_buy_notional)
 
 
 def _snapshot(monkeypatch, tags: dict):
@@ -148,3 +150,98 @@ class TestBuyFundsGate:
             _trade(remaining=10, lmt=1.7976931348623157e+308, aux=None),
         ])
         assert _open_buy_notional(client.current_account) == 0.0
+
+
+# Real tags IBKR returned for the cash account live-U25242754 (accounts/
+# live-U25242754/snapshots/latest.json, 2026-10-15). AccountType is INDIVIDUAL,
+# NOT "CASH": the AccountType tag describes ownership structure, so a gate
+# keyed on it never fired on this account between 2026-07-31 and 2026-10-15.
+CASH_ACCT = "U25242754"
+CASH_ACCT_TAGS = {"AccountType": "INDIVIDUAL", "AvailableFunds": "252.9",
+                  "BuyingPower": "252.9", "TotalCashValue": "252.9",
+                  "SettledCash": "252.9", "NetLiquidation": "252.9",
+                  "EquityWithLoanValue": "252.9", "FullInitMarginReq": "0.0"}
+
+
+class TestCashAccountDetection:
+    """The §8h cumulative open-BUY deduction keys on the account id, not on
+    AccountType (which reads INDIVIDUAL for cash and margin accounts alike)."""
+
+    async def test_incident_case_with_real_individual_tag(self, monkeypatch):
+        """$253 cash, $2,182 BUY: refused as a cash-account overspend."""
+        _client(monkeypatch, account=CASH_ACCT)
+        _snapshot(monkeypatch, CASH_ACCT_TAGS)
+        r = await _buy_funds_gate("BUY", 12, 181.82, strict=False)
+        assert not r["ok"]
+        assert "exceeds available funds" in r["error"]
+        assert "CASH" in r["error"]
+
+    async def test_open_buys_deducted_despite_individual_tag(self, monkeypatch):
+        """The gap: a BUY that fits AvailableFunds alone but not what open
+        BUYs already committed must be refused on the configured cash account."""
+        _client(monkeypatch, account=CASH_ACCT, open_trades=[
+            _trade(remaining=30, lmt=200.0, account=CASH_ACCT),  # $6,000
+        ])
+        _snapshot(monkeypatch, {**CASH_ACCT_TAGS, "AvailableFunds": "7000",
+                                "BuyingPower": "7000"})
+        r = await _buy_funds_gate("BUY", 10, 150.0, strict=False)  # $1,500 > $1,000
+        assert not r["ok"]
+        assert "committed to open BUY orders" in r["error"]
+        r2 = await _buy_funds_gate("BUY", 6, 150.0, strict=False)  # $900 fits
+        assert r2["ok"] and r2["funds_headroom_after"] == 100.0
+
+    async def test_live_prefixed_account_id_matches(self, monkeypatch):
+        _client(monkeypatch, account="live-" + CASH_ACCT, open_trades=[
+            _trade(remaining=30, lmt=200.0, account="live-" + CASH_ACCT),
+        ])
+        _snapshot(monkeypatch, {**CASH_ACCT_TAGS, "AvailableFunds": "7000"})
+        assert not (await _buy_funds_gate("BUY", 10, 150.0, strict=False))["ok"]
+
+    async def test_unlisted_individual_account_stays_margin(self, monkeypatch):
+        """2026-08-13 regression guard: an INDIVIDUAL account that is not in
+        the cash list never gets the cumulative deduction."""
+        _client(monkeypatch, account="U7777777", open_trades=[
+            _trade(remaining=30, lmt=200.0, account="U7777777"),
+        ])
+        _snapshot(monkeypatch, {"AccountType": "INDIVIDUAL",
+                                "AvailableFunds": "7000", "BuyingPower": "28000"})
+        r = await _buy_funds_gate("BUY", 10, 150.0, strict=False)
+        assert r["ok"]
+        assert "funds_headroom_after" in r and "CASH" not in str(r)
+
+    async def test_account_type_cash_still_detected_without_listing(self, monkeypatch):
+        _client(monkeypatch, account="U7777777")
+        _snapshot(monkeypatch, {"AccountType": "CASH", "AvailableFunds": "189.21"})
+        r = await _buy_funds_gate("BUY", 12, 181.82, strict=False)
+        assert not r["ok"] and "exceeds available funds" in r["error"]
+
+    async def test_setting_overrides_the_cash_list(self, monkeypatch):
+        monkeypatch.setattr(tools.settings, "ibkr_cash_accounts", "U9999999")
+        _client(monkeypatch, account="U9999999", open_trades=[
+            _trade(remaining=30, lmt=200.0, account="U9999999"),
+        ])
+        _snapshot(monkeypatch, {"AccountType": "INDIVIDUAL", "AvailableFunds": "7000",
+                                "BuyingPower": "28000"})
+        assert not (await _buy_funds_gate("BUY", 10, 150.0, strict=False))["ok"]
+        # ...and the default account is no longer treated as cash
+        assert not _is_cash_account(CASH_ACCT, "INDIVIDUAL")
+
+    async def test_empty_setting_means_no_listed_cash_accounts(self, monkeypatch):
+        monkeypatch.setattr(tools.settings, "ibkr_cash_accounts", "")
+        assert not _is_cash_account(CASH_ACCT, "INDIVIDUAL")
+        assert _is_cash_account(CASH_ACCT, "CASH")
+
+    def test_is_cash_account_edge_inputs(self):
+        assert _is_cash_account(CASH_ACCT, "INDIVIDUAL")
+        assert _is_cash_account(f" live-{CASH_ACCT} ", "")
+        assert not _is_cash_account(None, "INDIVIDUAL")
+        assert not _is_cash_account("All", "INDIVIDUAL")
+        assert not _is_cash_account("U4022128", "INDIVIDUAL")  # the margin account
+
+    def test_setting_parses_comma_list_from_env(self, monkeypatch):
+        monkeypatch.setenv("IBKR_CASH_ACCOUNTS", "U1, live-U2 ,,")
+        monkeypatch.setattr(tools, "settings", Settings())
+        assert tools._configured_cash_accounts() == frozenset({"U1", "U2"})
+
+    def test_default_setting_is_the_cash_account(self):
+        assert Settings().ibkr_cash_accounts == CASH_ACCT
