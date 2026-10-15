@@ -1,6 +1,10 @@
 """MCP tools for IBKR functionality."""
 
+import importlib.util
 import json
+import logging
+import os
+import sys
 import time
 from typing import Any, Sequence
 
@@ -14,6 +18,8 @@ from .config import settings
 from .option_gates import check_option_order
 from .orders import StagedOrder, staged_store
 from .utils import safe_float, validate_symbol, validate_symbols, IBKRError
+
+logger = logging.getLogger(__name__)
 
 
 LIVE_PORTS = {7496, 4001}
@@ -135,8 +141,274 @@ def _open_buy_notional(account: "str | None") -> float:
     return total
 
 
+# ---------------------------------------------------------------------------
+# Margin gate (owner 2026-10-15).
+#
+# On 2026-10-14 buying power on the margin account U4022128 fell from $97.6k to
+# $73.6k after manual buys and nothing stopped new bot entries (risk_guard only
+# pages). The rule lives in ONE place, the Trader repo's scripts/live/
+# margin_gate.py (line $75k, release $80k, margin account only, latch against
+# chop around the line). It is loaded here by FILE PATH so this server needs no
+# install-time dependency on that repo; TRADER_DIR overrides the checkout.
+#
+# Applied to: stock BUYs (_buy_funds_gate, margin path), option sell-to-open
+# (_run_option_gates), and BUY modifies that raise notional (modify_live_order).
+# NEVER applied to SELLs, stops, buy-to-close, sell-to-close, or cancels.
+#
+# Never raises. If the module cannot be loaded the inline fallback below applies
+# the same line (no latch) so the gate does not silently open.
+#
+# Burst ledger: resting unfilled orders do not lower BuyingPower until they fill,
+# so several entries confirmed back-to-back by ONE session (the 09:15 swing
+# scout) would each see the same BuyingPower. confirm_order therefore records
+# every stock BUY / STO put it submits on a gated account in _MG_PENDING, and the
+# gate subtracts the still-unfilled ones from BuyingPower. Only orders confirmed
+# by THIS process count - never the owner's manual ladders or other clients'
+# orders (rejected 2026-08-13, see the _buy_funds_gate docstring).
+# ---------------------------------------------------------------------------
+
+_MARGIN_GATE_ACCOUNT = "U4022128"
+_MARGIN_GATE_LINE_USD = 75000.0
+_MARGIN_GATE_RETRY_S = 60.0   # after a failed load, retry no sooner than this
+_MG_MODULE = None             # cached margin_gate module
+_MG_FAILED_AT: "float | None" = None
+# Orders this process confirmed that may still be unfilled:
+# {"order_id": int, "impact": float (BP dollars), "account": str, "client_id": int|None}
+_MG_PENDING: list = []
+_MG_DONE_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
+
+
+def _margin_gate_path() -> str:
+    base = os.environ.get("TRADER_DIR", "/Users/ttang/Trader")
+    return os.path.join(base, "scripts", "live", "margin_gate.py")
+
+
+def _load_margin_gate():
+    """The Trader repo's margin_gate module, or None if it cannot be loaded."""
+    global _MG_MODULE, _MG_FAILED_AT
+    if _MG_MODULE is not None:
+        return _MG_MODULE
+    now = time.monotonic()
+    if _MG_FAILED_AT is not None and now - _MG_FAILED_AT < _MARGIN_GATE_RETRY_S:
+        return None
+    path = _margin_gate_path()
+    saved_path = list(sys.path)
+    try:
+        spec = importlib.util.spec_from_file_location("trader_margin_gate", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"cannot build an import spec for {path}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        for attr in ("evaluate", "bp_impact_from_margin"):
+            if not callable(getattr(mod, attr, None)):
+                raise ImportError(f"margin_gate has no {attr}()")
+        _MG_MODULE, _MG_FAILED_AT = mod, None
+        return mod
+    except Exception as e:  # noqa: BLE001 - a broken gate module must not break orders
+        _MG_FAILED_AT = now
+        logger.warning("margin_gate unavailable (%s: %s) - using inline fallback "
+                       "(same $%s line, no latch)", type(e).__name__, e,
+                       f"{_MARGIN_GATE_LINE_USD:,.0f}")
+        return None
+    finally:
+        # margin_gate.py puts scripts/live first on sys.path to import common;
+        # do not leave that behind in the server process.
+        sys.path[:] = saved_path
+
+
+def _mg_money(x: "float | None") -> str:
+    return "unknown" if x is None else f"${x:,.0f}"
+
+
+def _norm_account(account) -> str:
+    a = str(account or "").strip()
+    return a.split("-", 1)[1] if a.lower().startswith("live-") else a
+
+
+def _inline_margin_gate(account, impact_usd, bp) -> dict:
+    """Fallback when margin_gate.py cannot be loaded: same line, no latch."""
+    line = _MARGIN_GATE_LINE_USD
+    if _norm_account(account) != _MARGIN_GATE_ACCOUNT:
+        return {"state": "n/a", "blocked": False, "reason": "", "bp": None}
+    b = _fnum(bp)
+    impact = max(0.0, _fnum(impact_usd) or 0.0)
+    if b is None:
+        return {"state": "unknown", "blocked": True, "bp": None,
+                "reason": "Buying power is unknown, so new orders that use margin "
+                          "are held until it can be read."}
+    if b < line:
+        return {"state": "blocked", "blocked": True, "bp": b,
+                "reason": f"Buying power is {_mg_money(b)}, below the "
+                          f"{_mg_money(line)} margin line, so new orders that use "
+                          "margin are blocked."}
+    if b - impact < line:
+        return {"state": "blocked", "blocked": True, "bp": b,
+                "reason": f"This order would take buying power from {_mg_money(b)} to "
+                          f"{_mg_money(b - impact)}, below the {_mg_money(line)} margin line."}
+    return {"state": "clear", "blocked": False, "reason": "", "bp": b}
+
+
+def _evaluate_margin(account, impact_usd, bp, update_latch: bool = True) -> dict:
+    """The shared module's verdict, or the inline fallback's. Never raises."""
+    mg = _load_margin_gate()
+    if mg is not None:
+        try:
+            v = mg.evaluate(account, impact_usd, bp=bp, update_latch=update_latch)
+            if isinstance(v, dict):
+                return v
+        except Exception as e:  # noqa: BLE001
+            logger.warning("margin_gate.evaluate failed (%s: %s) - using inline fallback",
+                           type(e).__name__, e)
+    return _inline_margin_gate(account, impact_usd, bp)
+
+
+def _pending_margin_impact(account) -> float:
+    """Buying-power dollars this process has committed on `account` to orders
+    that are still working and wholly unfilled. Entries whose order is gone,
+    done, or partly filled are pruned (a fill is already in BuyingPower).
+    Lookup failure counts as 0 for the affected entry. Never raises."""
+    try:
+        acct = _norm_account(account)
+        if not any(e.get("account") == acct for e in _MG_PENDING):
+            return 0.0
+        by_id: dict = {}
+        for t in ibkr_client.ib.openTrades():
+            try:
+                by_id.setdefault(int(t.order.orderId), []).append(t)
+            except Exception:  # noqa: BLE001
+                continue
+        total, keep = 0.0, []
+        for e in list(_MG_PENDING):
+            if e.get("account") != acct:
+                keep.append(e)
+                continue
+            try:
+                trade = None
+                for t in by_id.get(e["order_id"], []):
+                    cid = getattr(t.order, "clientId", None)
+                    if (e.get("client_id") is None or not isinstance(cid, int)
+                            or cid == e["client_id"]):
+                        trade = t
+                        break
+                if trade is None:
+                    continue                      # no longer open: dropped
+                status = str(getattr(trade.orderStatus, "status", "") or "")
+                filled = _fnum(getattr(trade.orderStatus, "filled", 0)) or 0.0
+                if status in _MG_DONE_STATUSES or filled > 0:
+                    continue                      # done or filling: BP has it
+                total += float(e["impact"])
+                keep.append(e)
+            except Exception:  # noqa: BLE001 - this entry counts as 0, stays
+                keep.append(e)
+        _MG_PENDING[:] = keep
+        return total
+    except Exception as e:  # noqa: BLE001
+        logger.warning("margin gate pending lookup failed (%s: %s)", type(e).__name__, e)
+        return 0.0
+
+
+def _margin_gate_applies(account) -> bool:
+    mg = _load_margin_gate()
+    if mg is not None:
+        try:
+            return bool(mg.applies_to(account, mg.gate_config()))
+        except Exception:  # noqa: BLE001
+            pass
+    return _norm_account(account) == _MARGIN_GATE_ACCOUNT
+
+
+def _placed_order_id(result):
+    """orderId from a place_* result (bracket results nest it under 'parent')."""
+    try:
+        parent = result.get("parent")
+        src = parent if isinstance(parent, dict) else result
+        return int(src["order_id"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _record_pending_margin_order(account, order_id, impact_usd) -> None:
+    """Remember an order this process just sent so later gate checks subtract it
+    until it fills. Only margin-gated accounts are recorded. Never raises."""
+    try:
+        oid, impact = order_id, _fnum(impact_usd)
+        if oid is None or impact is None or impact <= 0:
+            return
+        if not _margin_gate_applies(account):
+            return
+        cid = ibkr_client.client_id
+        _MG_PENDING.append({"order_id": int(oid), "impact": float(impact),
+                            "account": _norm_account(account),
+                            "client_id": cid if isinstance(cid, int) else None})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("margin gate ledger record failed (%s: %s)", type(e).__name__, e)
+
+
+def _adjust_pending_margin_order(order_id, delta_usd) -> None:
+    """A successful modify changed a recorded order's notional by delta_usd."""
+    try:
+        d = _fnum(delta_usd)
+        if d is None:
+            return
+        for e in _MG_PENDING:
+            if e.get("order_id") == int(order_id):
+                e["impact"] = max(0.0, float(e["impact"]) + d)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _margin_gate_refusal(account, impact_usd=0.0, bp=None) -> "str | None":
+    """None when the order may proceed, else a plain-English refusal that starts
+    with "Margin gate: ". `bp` is the caller's live BuyingPower (None lets the
+    shared module fall back to eventd's broker snapshot, else fail closed).
+
+    Two passes: (1) the live reading, which also drives the shared latch;
+    (2) when this process has unfilled orders on the account, the same check
+    on BuyingPower minus those orders (latch NOT updated, so a hypothetical
+    number never trips the shared latch). Never raises."""
+    verdict = _evaluate_margin(account, impact_usd, bp)
+    if verdict.get("blocked"):
+        reason = str(verdict.get("reason") or
+                     "Buying power is too low for new orders that use margin.")
+        return "Margin gate: " + reason
+    if verdict.get("state") == "n/a":
+        return None
+    live_bp = _fnum(verdict.get("bp"))
+    pending = _pending_margin_impact(account)
+    if pending > 0 and live_bp is not None:
+        v2 = _evaluate_margin(account, impact_usd, live_bp - pending, update_latch=False)
+        if v2.get("blocked"):
+            reason = str(v2.get("reason") or
+                         "Buying power is too low for new orders that use margin.")
+            return ("Margin gate: " + reason.rstrip(".") +
+                    f" (counting {_mg_money(pending)} of orders already sent this "
+                    "session that have not filled yet).")
+    return None
+
+
+def _margin_gate_option_impact(whatif, bp, available_funds) -> float:
+    """Buying-power impact of an option sell-to-open from its what-if initial
+    margin change. 0.0 when the what-if is unavailable (the line/latch still
+    applies to the order)."""
+    imc = _fnum(whatif.get("init_margin_change")) if isinstance(whatif, dict) else None
+    if imc is None:
+        return 0.0
+    mg = _load_margin_gate()
+    if mg is not None:
+        try:
+            v = mg.bp_impact_from_margin(imc, bp, available_funds)
+            if v is not None:
+                return max(0.0, float(v))
+        except Exception as e:  # noqa: BLE001
+            logger.warning("margin_gate.bp_impact_from_margin failed (%s: %s)",
+                           type(e).__name__, e)
+    b, af = _fnum(bp), _fnum(available_funds)
+    ratio = (b / af) if (b is not None and af is not None and b > 0 and af > 0) else 4.0
+    return max(0.0, imc) * ratio
+
+
 async def _buy_funds_gate(action: str, quantity: int, price: float,
-                          strict: bool) -> dict:
+                          strict: bool, margin_gate: bool = True) -> dict:
     """Refuse a BUY whose notional exceeds funds headroom.
 
     CASH accounts: headroom = AvailableFunds (fallback TotalCashValue)
@@ -157,6 +429,12 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
     offline or the summary fetch fails — confirm re-validates.
     strict=True (confirm time): those failures refuse the order, same
     contract as the quote-drift gate.
+
+    Margin gate (2026-10-15): on the margin path, after the checks above,
+    a BUY that would use margin while BuyingPower is at/below the line
+    (or would push it below) is refused with "Margin gate: <reason>".
+    Cash-account path is untouched. margin_gate=False skips it (protective
+    STP orders are never gated).
     """
     if action.upper() != "BUY" or price <= 0 or quantity <= 0:
         return {"ok": True}
@@ -210,6 +488,11 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
         return {"ok": False, "error": (
             f"BUY notional ${notional:,.2f} exceeds {ceiling_tag} "
             f"${ceiling:,.2f} (account {account or 'current'}, margin). Refusing.")}
+    if margin_gate:
+        refusal = _margin_gate_refusal(account, notional,
+                                       bp=_fnum(snap.get("BuyingPower")))
+        if refusal:
+            return {"ok": False, "error": refusal}
     result = {"ok": True, "funds_headroom_after": round(ceiling - notional, 2)}
     if open_buy and notional + open_buy > ceiling:
         result["warning"] = (
@@ -217,6 +500,61 @@ async def _buy_funds_gate(action: str, quantity: int, price: float,
             f"${open_buy:,.2f} resting BUYs) exceeds {ceiling_tag} ${ceiling:,.2f}; "
             f"not blocking — IBKR margin checks apply at fill time")
     return result
+
+
+async def _modify_margin_refusal(order_id: int, qty, lmt,
+                                 out: "dict | None" = None) -> "str | None":
+    """Margin gate for modify_live_order. Looks up the live order and gates only
+    the INCREASE in unfilled notional of a stock BUY (qty up and/or limit up):
+    impact = new unfilled notional - old unfilled notional. Decreases, SELLs,
+    option and stop orders are never gated. Returns a refusal string or None.
+    Never raises (a failed lookup falls through - modify_order reports it).
+    out (optional) receives {"delta": signed notional change} for stock BUY LMTs
+    so a successful modify can adjust the burst ledger."""
+    try:
+        try:
+            await ibkr_client._ensure_connected()
+        except Exception:  # noqa: BLE001 - modify_order will surface a real outage
+            pass
+        target = None
+        for t in ibkr_client.ib.trades():
+            if t.order.orderId == int(order_id):
+                target = t
+                break
+        if target is None:
+            return None
+        o, c = target.order, target.contract
+        if str(getattr(o, "action", "")).upper() != "BUY":
+            return None
+        if str(getattr(c, "secType", "STK") or "STK").upper() != "STK":
+            return None
+        if str(getattr(o, "orderType", "")).upper() not in ("LMT", "STP LMT"):
+            return None
+        old_qty = _fnum(getattr(o, "totalQuantity", None))
+        old_px = _fnum(getattr(o, "lmtPrice", None))
+        if old_qty is None or old_px is None or old_qty <= 0 or old_px <= 0:
+            return None
+        filled = _fnum(getattr(target.orderStatus, "filled", 0)) or 0.0
+        new_qty = float(int(qty)) if qty is not None else old_qty
+        new_px = float(lmt) if lmt is not None else old_px
+        old_notional = max(0.0, old_qty - filled) * old_px
+        new_notional = max(0.0, new_qty - filled) * new_px
+        increase = new_notional - old_notional
+        if out is not None:
+            out["delta"] = increase
+        if increase <= 0:
+            return None
+        account = getattr(o, "account", "") or ibkr_client.current_account
+        bp = None
+        if account == ibkr_client.current_account:
+            try:
+                bp = _fnum((await _funds_snapshot(None)).get("BuyingPower"))
+            except Exception:  # noqa: BLE001 - None -> broker snapshot or fail closed
+                bp = None
+        return _margin_gate_refusal(account, increase, bp=bp)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("modify margin gate lookup failed (%s: %s)", type(e).__name__, e)
+        return None
 
 
 async def _validate_order_inputs(symbol: str, action: str, quantity: int,
@@ -317,10 +655,14 @@ def _contract_dict(contract) -> dict:
 
 
 async def _run_option_gates(intent: str, action: str, quantity: int, limit_price: float,
-                            contract, allow_no_quote: bool):
+                            contract, allow_no_quote: bool,
+                            impact_out: "dict | None" = None):
     """Fetch fresh positions/open-orders/quote/whatif state and run
     check_option_order. Shared by stage_option_order and the confirm_order
-    OPT dispatch so both paths validate against the exact same rules."""
+    OPT dispatch so both paths validate against the exact same rules.
+
+    impact_out (optional): receives {"impact": <BP dollars>} for a margin-gated
+    sell-to-open put, so confirm_order can record it in the burst ledger."""
     contract_dict = _contract_dict(contract)
     positions = await ibkr_client.get_portfolio()
     open_orders = await ibkr_client.get_open_trades()
@@ -339,11 +681,25 @@ async def _run_option_gates(intent: str, action: str, quantity: int, limit_price
         funds = await _funds_snapshot(None)
     except Exception:
         funds = {}
-    return check_option_order(
+    ok, reasons, warnings = check_option_order(
         intent=intent, action=action, qty=quantity, limit_price=limit_price,
         contract=contract_dict, positions=positions, open_orders=open_orders,
         quote=quote, whatif=whatif, funds=funds, allow_no_quote=allow_no_quote,
     )
+    # Margin gate (2026-10-15): only a SELL that OPENS a short PUT adds margin.
+    # BTC / STC are never gated; an STO call that passed check_option_order is
+    # covered (naked calls are refused there) and uses no margin.
+    if (ok and intent.upper() == "STO" and action.upper() == "SELL"
+            and (contract_dict.get("right") or "").upper() == "P"):
+        bp = _fnum(funds.get("BuyingPower"))
+        impact = _margin_gate_option_impact(
+            whatif, bp, _fnum(funds.get("AvailableFunds")))
+        if impact_out is not None:
+            impact_out["impact"] = impact
+        refusal = _margin_gate_refusal(ibkr_client.current_account, impact, bp=bp)
+        if refusal:
+            return False, [refusal], warnings
+    return ok, reasons, warnings
 
 
 # Create the server instance
@@ -974,10 +1330,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                         "submitted": False,
                         "error": f"could not qualify option contract: {e}"}))]
 
+                gate_impact: dict = {}
                 ok, reasons, warnings = await _run_option_gates(
                     intent=order.intent or "", action=order.action,
                     quantity=order.quantity, limit_price=order.limit_price,
                     contract=contract, allow_no_quote=False,
+                    impact_out=gate_impact,
                 )
                 if not ok:
                     return [TextContent(type="text", text=json.dumps({
@@ -997,6 +1355,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     return [TextContent(type="text", text=json.dumps({
                         "submitted": False,
                         "error": f"IBKR rejected order: {e}"}))]
+
+                # Burst ledger: a sold put reserves margin until it fills.
+                if "impact" in gate_impact:
+                    _record_pending_margin_order(
+                        ibkr_client.current_account, _placed_order_id(result),
+                        gate_impact["impact"])
 
                 staged_store.remove(staged_id)
                 return [TextContent(type="text", text=json.dumps({
@@ -1028,7 +1392,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             # SELL children pass through _buy_funds_gate untouched.
             fg = await _buy_funds_gate(order.action, order.quantity,
                                        ref_price if ref_price > 0 else 0.0,
-                                       strict=True)
+                                       strict=True,
+                                       margin_gate=(order.order_type != "STP"))
             if not fg["ok"]:
                 return [TextContent(type="text",
                                     text=json.dumps({"submitted": False, "error": fg["error"]}))]
@@ -1094,6 +1459,14 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                                     text=json.dumps({"submitted": False,
                                                      "error": f"IBKR rejected order: {e}"}))]
 
+            # Burst ledger: remember a margin BUY just sent (bracket: the parent
+            # only) so the next confirms in this session see it until it fills.
+            if (order.action.upper() == "BUY" and order.order_type != "STP"
+                    and ref_price > 0):
+                _record_pending_margin_order(
+                    ibkr_client.current_account, _placed_order_id(result),
+                    order.quantity * ref_price)
+
             # Cleanup local staged store: remove parent + bracket children together.
             if children:
                 staged_store.remove_bracket(staged_id)
@@ -1126,7 +1499,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                 return [TextContent(type="text",
                                     text=json.dumps({"staged": False, "error": v["error"]}))]
 
-            fg = await _buy_funds_gate(action, quantity, stop_price, strict=False)
+            # Stops are never margin-gated (margin_gate=False).
+            fg = await _buy_funds_gate(action, quantity, stop_price, strict=False,
+                                       margin_gate=False)
             if not fg["ok"]:
                 return [TextContent(type="text",
                                     text=json.dumps({"staged": False, "error": fg["error"]}))]
@@ -1287,6 +1662,15 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
                     "error": (f"Live port {ibkr_client.port} detected but ENABLE_LIVE_TRADING=false. "
                               "Refusing to modify."),
                 }))]
+
+            # Margin gate (2026-10-15): only a BUY modify that RAISES notional
+            # is gated; decreases, SELLs, stops and options pass untouched.
+            modify_gate: dict = {}
+            refusal = await _modify_margin_refusal(order_id, qty, lmt, out=modify_gate)
+            if refusal:
+                return [TextContent(type="text", text=json.dumps({
+                    "modified": False, "error": refusal}))]
+
             try:
                 result = await ibkr_client.modify_order(
                     order_id=order_id,
@@ -1297,6 +1681,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> Sequence[TextConten
             except Exception as e:
                 return [TextContent(type="text", text=json.dumps({
                     "modified": False, "error": f"IBKR modify failed: {e}"}))]
+            if isinstance(result, dict) and result.get("modified") and "delta" in modify_gate:
+                _adjust_pending_margin_order(order_id, modify_gate["delta"])
             return [TextContent(type="text", text=json.dumps(result, indent=2, default=str))]
 
         elif name == "cancel_staged_order":
