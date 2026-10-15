@@ -18,7 +18,12 @@ class Settings(BaseSettings):
     # Account Management
     ibkr_default_account: Optional[str] = None
     ibkr_managed_accounts: Optional[str] = None
-    
+    # Cash (non-margin) accounts, comma-separated. The cumulative open-BUY
+    # funds gate (tools._buy_funds_gate, STRATEGY.md §8h) keys on this list:
+    # IBKR's AccountType tag reads INDIVIDUAL for cash AND margin accounts, so
+    # it cannot tell them apart. Override with IBKR_CASH_ACCOUNTS (empty = none).
+    ibkr_cash_accounts: str = "U25242754"
+
     # Logging
     log_level: str = "INFO"
     log_file: str = "/tmp/ibkr-mcp-server.log"
