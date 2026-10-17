@@ -55,7 +55,7 @@ def _fresh_caches(monkeypatch, tmp_path):
     the shared module's files (broker_state / latch) point at tmp_path."""
     monkeypatch.setenv("MARGIN_GATE_LIVE_DIR", str(tmp_path))
     # Rule tests use the 2026-10-14 numbers against a $75k line; the shipped
-    # line is $100k (owner 2026-10-15) - see test_shipped_line_is_100k.
+    # line is $200k (owner 2026-10-17) - see test_shipped_line_is_200k.
     monkeypatch.setattr(tools, "_MARGIN_GATE_LINE_USD", 75000.0)
     monkeypatch.setattr(tools, "_MG_MODULE", None)
     monkeypatch.setattr(tools, "_MG_FAILED_AT", None)
@@ -844,10 +844,10 @@ class TestBurstLedger:
         assert body["error"] == _THIRD_REFUSAL
 
 
-def test_shipped_line_is_100k():
-    """Owner 2026-10-15: line raised $75k -> $100k (release $105k)."""
+def test_shipped_line_is_200k():
+    """Owner: line $75k -> $100k (2026-10-15) -> $150k (10-16) -> $200k (10-17), release +$5k."""
     src = open(tools.__file__).read()
-    assert "_MARGIN_GATE_LINE_USD = 100000.0" in src
+    assert "_MARGIN_GATE_LINE_USD = 200000.0" in src
     d = _real_trader_dir()
     if d is None:
         pytest.skip("Trader margin_gate.py not found")
@@ -860,4 +860,4 @@ def test_shipped_line_is_100k():
     finally:
         sys.path[:] = saved
     g = mod.gate_config()
-    assert g["buying_power_crit_usd"] == 100000 and g["buying_power_clear_usd"] == 5000
+    assert g["buying_power_crit_usd"] == 200000 and g["buying_power_clear_usd"] == 5000
