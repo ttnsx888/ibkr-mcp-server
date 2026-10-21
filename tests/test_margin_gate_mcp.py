@@ -58,7 +58,11 @@ def _fresh_caches(monkeypatch, tmp_path):
     # line is $200k (owner 2026-10-17) - see test_shipped_line_is_200k.
     monkeypatch.setattr(tools, "_MARGIN_GATE_LINE_USD", 75000.0)
     monkeypatch.setattr(tools, "_MG_MODULE", None)
+    monkeypatch.setattr(tools, "_MG_SIG", None)
     monkeypatch.setattr(tools, "_MG_FAILED_AT", None)
+    monkeypatch.setattr(tools, "_MG_FAILED_SIG", None)
+    # the inline fallback reads Trader's config; pin it to "nothing" so the 75k constant rules
+    monkeypatch.setattr(tools, "_fallback_config_risk", lambda: {})
     monkeypatch.setattr(tools, "_FUNDS_CACHE", {})
     monkeypatch.setattr(tools, "_QUOTE_CACHE", {})
     monkeypatch.setattr(tools, "_MG_PENDING", [])
@@ -532,16 +536,168 @@ class TestFallbackWhenModuleMissing:
         assert (await _buy_funds_gate("BUY", 10, 100.0, strict=False))["ok"]
 
     def test_failed_load_not_retried_inside_window(self, monkeypatch, tmp_path):
-        monkeypatch.setenv("TRADER_DIR", str(tmp_path / "nowhere"))
+        d = tmp_path / "trader"
+        (d / "scripts" / "live").mkdir(parents=True)
+        f = d / "scripts" / "live" / "margin_gate.py"
+        f.write_text("raise RuntimeError('boom')\n")
+        monkeypatch.setenv("TRADER_DIR", str(d))
         assert tools._load_margin_gate() is None
-        # file appears, but the retry window has not elapsed yet
+        # same (still broken) file inside the retry window: not re-exec'd
+        calls = []
+        orig = tools.importlib.util.spec_from_file_location
+        monkeypatch.setattr(tools.importlib.util, "spec_from_file_location",
+                            lambda *a, **k: (calls.append(1), orig(*a, **k))[1])
+        assert tools._load_margin_gate() is None and calls == []
+        # window elapsed -> retried
+        monkeypatch.setattr(tools, "_MG_FAILED_AT", None)
+        assert tools._load_margin_gate() is None and calls == [1]
+
+    def test_fixed_file_is_picked_up_immediately(self, monkeypatch, tmp_path):
+        d = tmp_path / "trader"
+        (d / "scripts" / "live").mkdir(parents=True)
+        f = d / "scripts" / "live" / "margin_gate.py"
+        f.write_text("raise RuntimeError('boom')\n")
+        monkeypatch.setenv("TRADER_DIR", str(d))
+        assert tools._load_margin_gate() is None
+        f.write_text(_STUB_GATE.format(tag="v1"))          # changed file: no waiting
+        mod = tools._load_margin_gate()
+        assert mod is not None and mod.TAG == "v1"
+
+
+_STUB_GATE = """
+TAG = {tag!r}
+def evaluate(*a, **k):
+    return {{"state": "clear", "blocked": False, "reason": "", "bp": 1.0, "tag": TAG}}
+def bp_impact_from_margin(*a, **k):
+    return 0.0
+"""
+
+
+def _trader_tree(tmp_path, tag="v1"):
+    d = tmp_path / "trader"
+    (d / "scripts" / "live").mkdir(parents=True)
+    f = d / "scripts" / "live" / "margin_gate.py"
+    f.write_text(_STUB_GATE.format(tag=tag))
+    return d, f
+
+
+class TestSelfReload:
+    """A Trader merge edits margin_gate.py; long-lived MCP processes must follow it."""
+
+    def test_changed_file_is_reloaded(self, monkeypatch, tmp_path):
+        d, f = _trader_tree(tmp_path, "v1")
+        monkeypatch.setenv("TRADER_DIR", str(d))
+        m1 = tools._load_margin_gate()
+        assert m1.TAG == "v1" and tools._load_margin_gate() is m1      # cached while unchanged
+        f.write_text(_STUB_GATE.format(tag="v2") + "# longer\n")
+        m2 = tools._load_margin_gate()
+        assert m2 is not m1 and m2.TAG == "v2"
+        assert tools._load_margin_gate() is m2
+
+    def test_same_size_rewrite_detected_by_mtime(self, monkeypatch, tmp_path):
+        d, f = _trader_tree(tmp_path, "v1")
+        monkeypatch.setenv("TRADER_DIR", str(d))
+        assert tools._load_margin_gate().TAG == "v1"
+        st = f.stat()
+        f.write_text(_STUB_GATE.format(tag="v2"))                       # same length
+        os.utime(f, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000))
+        assert tools._load_margin_gate().TAG == "v2"
+
+    def test_broken_edit_keeps_previous_good_module(self, monkeypatch, tmp_path):
+        d, f = _trader_tree(tmp_path, "v1")
+        monkeypatch.setenv("TRADER_DIR", str(d))
+        m1 = tools._load_margin_gate()
+        f.write_text("raise RuntimeError('half written')\n")
+        assert tools._load_margin_gate() is m1           # never drops to the looser inline path
+        f.write_text(_STUB_GATE.format(tag="v3"))
+        assert tools._load_margin_gate().TAG == "v3"
+
+    def test_reload_uses_the_new_rule_end_to_end(self, monkeypatch, tmp_path):
+        d, f = _trader_tree(tmp_path, "v1")
+        monkeypatch.setenv("TRADER_DIR", str(d))
+        assert tools._evaluate_margin(MARGIN_ACCT, 0, 300000)["tag"] == "v1"
+        f.write_text(_STUB_GATE.format(tag="v2") + "# changed\n")
+        assert tools._evaluate_margin(MARGIN_ACCT, 0, 300000)["tag"] == "v2"
+
+    def test_sys_path_untouched_by_reload(self, monkeypatch, tmp_path):
+        d, f = _trader_tree(tmp_path, "v1")
+        monkeypatch.setenv("TRADER_DIR", str(d))
+        tools._load_margin_gate()
+        before = list(sys.path)
+        f.write_text(_STUB_GATE.format(tag="v2") + "# x\n")
+        tools._load_margin_gate()
+        assert sys.path == before
+
+    def test_real_module_reload_keeps_override_following(self, monkeypatch, tmp_path, real_gate):
+        """The real module, touched on disk, reloads and still resolves the override."""
         d = _real_trader_dir()
-        if d is None:
-            pytest.skip("Trader margin_gate.py not found")
-        monkeypatch.setenv("TRADER_DIR", d)
-        assert tools._load_margin_gate() is None
-        monkeypatch.setattr(tools, "_MG_FAILED_AT", None)   # window elapsed
-        assert tools._load_margin_gate() is not None
+        monkeypatch.setenv("MARGIN_GATE_LIVE_DIR", str(tmp_path))
+        live = tmp_path
+        (live / "margin_gate_override.json").write_text(json.dumps({"line_usd": 250000}))
+        m1 = tools._load_margin_gate()
+        # force a different signature without touching the real file
+        monkeypatch.setattr(tools, "_MG_SIG", ("stale",))
+        m2 = tools._load_margin_gate()
+        assert m2 is not m1 and callable(m2.evaluate)
+
+
+class TestInlineFallbackLine:
+    """Fallback when margin_gate.py cannot load: max(config, valid override), never looser."""
+
+    @pytest.fixture(autouse=True)
+    def _live(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("MARGIN_GATE_LIVE_DIR", str(tmp_path))
+        self.live = tmp_path
+        monkeypatch.setattr(tools, "_fallback_config_risk",
+                            lambda: {"buying_power_crit_usd": 200000, "margin_line_min_usd": 100000})
+
+    def _ov(self, obj):
+        (self.live / "margin_gate_override.json").write_text(
+            obj if isinstance(obj, str) else json.dumps(obj))
+
+    def test_no_override_uses_config(self):
+        assert tools._fallback_margin_line() == 200000
+
+    def test_higher_override_wins(self):
+        self._ov({"line_usd": 250000})
+        assert tools._fallback_margin_line() == 250000
+
+    def test_lower_override_never_loosens(self):
+        self._ov({"line_usd": 150000})
+        assert tools._fallback_margin_line() == 200000
+
+    def test_below_floor_or_garbage_override_ignored(self):
+        for bad in ({"line_usd": 50000}, {"line_usd": "x"}, {"line_usd": True}, "{not json",
+                    {"line_usd": float("nan")}, [1, 2]):
+            self._ov(bad)
+            assert tools._fallback_margin_line() == 200000, bad
+
+    def test_corrupt_override_falls_to_last_good(self):
+        (self.live / "margin_gate_override.last_good.json").write_text(json.dumps({"line_usd": 250000}))
+        self._ov("{torn")
+        assert tools._fallback_margin_line() == 250000
+        (self.live / "margin_gate_override.json").unlink()      # no file = no override at all
+        assert tools._fallback_margin_line() == 200000
+
+    def test_config_unreadable_uses_constant(self, monkeypatch):
+        monkeypatch.setattr(tools, "_fallback_config_risk", lambda: {})
+        self._ov({"line_usd": 250000})
+        assert tools._fallback_margin_line() == 250000
+        self._ov("{torn")
+        assert tools._fallback_margin_line() == tools._MARGIN_GATE_LINE_USD
+
+    async def test_inline_gate_blocks_at_override(self, monkeypatch, no_gate_module):
+        self._ov({"line_usd": 250000})
+        r = tools._inline_margin_gate(MARGIN_ACCT, 0, 240000)
+        assert r["blocked"] and "$250,000" in r["reason"]
+        assert tools._inline_margin_gate(MARGIN_ACCT, 20000, 260000)["blocked"]
+        assert not tools._inline_margin_gate(MARGIN_ACCT, 5000, 260000)["blocked"]
+
+    async def test_evaluate_raising_still_honours_override(self, monkeypatch, real_gate):
+        monkeypatch.setattr(real_gate, "evaluate", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
+        self._ov({"line_usd": 250000})
+        r = tools._evaluate_margin(MARGIN_ACCT, 0, 240000)
+        assert r["blocked"] and "$250,000" in r["reason"]
 
 
 class TestModuleLoading:

@@ -155,8 +155,11 @@ def _open_buy_notional(account: "str | None") -> float:
 # (_run_option_gates), and BUY modifies that raise notional (modify_live_order).
 # NEVER applied to SELLs, stops, buy-to-close, sell-to-close, or cancels.
 #
-# Never raises. If the module cannot be loaded the inline fallback below applies
-# the same line (no latch) so the gate does not silently open.
+# Never raises. The module is re-exec'd whenever its file changes on disk (mtime/size
+# checked on every gate call), so a Trader merge reaches long-lived MCP processes with
+# no restart. If the module cannot be loaded the inline fallback below applies the
+# higher of the config line and the owner's dashboard override (no latch), so the gate
+# does not silently open or loosen.
 #
 # Burst ledger: resting unfilled orders do not lower BuyingPower until they fill,
 # so several entries confirmed back-to-back by ONE session (the 09:15 swing
@@ -169,31 +172,71 @@ def _open_buy_notional(account: "str | None") -> float:
 
 _MARGIN_GATE_ACCOUNT = "U4022128"
 _MARGIN_GATE_LINE_USD = 200000.0   # fallback only; owner 2026-10-17 (was 150k from 10-16, 100k from 10-15, 75k before)
+_MARGIN_GATE_FLOOR_USD = 100000.0  # owner-override floor (Trader risk.margin_line_min_usd)
 _MARGIN_GATE_RETRY_S = 60.0   # after a failed load, retry no sooner than this
 _MG_MODULE = None             # cached margin_gate module
+_MG_SIG: "tuple | None" = None  # (mtime_ns, size) of margin_gate.py / common.py when _MG_MODULE was loaded
 _MG_FAILED_AT: "float | None" = None
+_MG_FAILED_SIG: "tuple | None" = None
 # Orders this process confirmed that may still be unfilled:
 # {"order_id": int, "impact": float (BP dollars), "account": str, "client_id": int|None}
 _MG_PENDING: list = []
 _MG_DONE_STATUSES = frozenset({"Filled", "Cancelled", "ApiCancelled", "Inactive"})
 
 
+def _trader_dir() -> str:
+    return os.environ.get("TRADER_DIR", "/Users/ttang/Trader")
+
+
 def _margin_gate_path() -> str:
-    base = os.environ.get("TRADER_DIR", "/Users/ttang/Trader")
-    return os.path.join(base, "scripts", "live", "margin_gate.py")
+    return os.path.join(_trader_dir(), "scripts", "live", "margin_gate.py")
+
+
+def _margin_gate_sig() -> "tuple | None":
+    """(mtime_ns, size) of margin_gate.py and its sibling common.py, or None when
+    margin_gate.py cannot be stat()ed.  Two stat() calls per gate check: cheap."""
+    try:
+        p = _margin_gate_path()
+        a = os.stat(p)
+        try:
+            b = os.stat(os.path.join(os.path.dirname(p), "common.py"))
+            bs = (b.st_mtime_ns, b.st_size)
+        except OSError:
+            bs = None
+        return (a.st_mtime_ns, a.st_size, bs)
+    except OSError:
+        return None
 
 
 def _load_margin_gate():
-    """The Trader repo's margin_gate module, or None if it cannot be loaded."""
-    global _MG_MODULE, _MG_FAILED_AT
-    if _MG_MODULE is not None:
+    """The Trader repo's margin_gate module, or None if it cannot be loaded.
+
+    Self-reloading (2026-10-21, after a merged margin_gate.py left every long-lived MCP
+    process on the old rule): the file's mtime/size is checked on every call and the
+    module is re-exec'd when it changed, so a Trader merge takes effect with no restart.
+    A reload that fails keeps the previous good module (never silently drops to the
+    inline fallback because of a half-written file) and retries on the next change or
+    after _MARGIN_GATE_RETRY_S."""
+    global _MG_MODULE, _MG_SIG, _MG_FAILED_AT, _MG_FAILED_SIG
+    sig = _margin_gate_sig()
+    if _MG_MODULE is not None and sig == _MG_SIG:
         return _MG_MODULE
     now = time.monotonic()
-    if _MG_FAILED_AT is not None and now - _MG_FAILED_AT < _MARGIN_GATE_RETRY_S:
-        return None
+    if (_MG_FAILED_AT is not None and sig == _MG_FAILED_SIG
+            and now - _MG_FAILED_AT < _MARGIN_GATE_RETRY_S):
+        return _MG_MODULE            # last good module (None before the first good load)
     path = _margin_gate_path()
     saved_path = list(sys.path)
+    saved_common = sys.modules.get("common")
+    live_dir = os.path.dirname(path)
+    swapped_common = False
     try:
+        if _MG_MODULE is not None and saved_common is not None:
+            # a changed common.py must be re-imported too; restored below if the reload fails
+            cf = getattr(saved_common, "__file__", "") or ""
+            if os.path.dirname(os.path.abspath(cf)) == live_dir:
+                del sys.modules["common"]
+                swapped_common = True
         spec = importlib.util.spec_from_file_location("trader_margin_gate", path)
         if spec is None or spec.loader is None:
             raise ImportError(f"cannot build an import spec for {path}")
@@ -202,13 +245,21 @@ def _load_margin_gate():
         for attr in ("evaluate", "bp_impact_from_margin"):
             if not callable(getattr(mod, attr, None)):
                 raise ImportError(f"margin_gate has no {attr}()")
-        _MG_MODULE, _MG_FAILED_AT = mod, None
+        if _MG_MODULE is not None:
+            logger.info("margin_gate.py changed on disk - reloaded")
+        _MG_MODULE, _MG_SIG, _MG_FAILED_AT, _MG_FAILED_SIG = mod, sig, None, None
         return mod
     except Exception as e:  # noqa: BLE001 - a broken gate module must not break orders
-        _MG_FAILED_AT = now
+        _MG_FAILED_AT, _MG_FAILED_SIG = now, sig
+        if swapped_common and saved_common is not None:
+            sys.modules["common"] = saved_common
+        if _MG_MODULE is not None:
+            logger.warning("margin_gate reload failed (%s: %s) - keeping the previously "
+                           "loaded rule", type(e).__name__, e)
+            return _MG_MODULE
         logger.warning("margin_gate unavailable (%s: %s) - using inline fallback "
-                       "(same $%s line, no latch)", type(e).__name__, e,
-                       f"{_MARGIN_GATE_LINE_USD:,.0f}")
+                       "(config line or dashboard override, whichever is higher, no latch)",
+                       type(e).__name__, e)
         return None
     finally:
         # margin_gate.py puts scripts/live first on sys.path to import common;
@@ -225,9 +276,79 @@ def _norm_account(account) -> str:
     return a.split("-", 1)[1] if a.lower().startswith("live-") else a
 
 
+def _mg_live_dir() -> str:
+    d = os.environ.get("MARGIN_GATE_LIVE_DIR")
+    return d if d else os.path.join(_trader_dir(), "data", "live")
+
+
+def _mg_read_json(path: str):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:  # noqa: BLE001 - missing / torn / corrupt -> treated as absent
+        return None
+
+
+def _mg_pos(v) -> "float | None":
+    """A finite positive number (bool / NaN / inf / junk -> None)."""
+    if isinstance(v, bool):
+        return None
+    x = _fnum(v)
+    return x if (x is not None and x == x and x not in (float("inf"), float("-inf")) and x > 0) else None
+
+
+def _fallback_config_risk() -> dict:
+    """Trader's `risk` config block (config.default.json overlaid by the profile's
+    live_agents.json), {} when unreadable.  Never raises."""
+    merged: dict = {}
+    try:
+        base = _trader_dir()
+        for rel in (("scripts", "live", "config.default.json"),
+                    ("accounts", "live-" + _MARGIN_GATE_ACCOUNT, "live_agents.json")):
+            d = _mg_read_json(os.path.join(base, *rel))
+            if isinstance(d, dict) and isinstance(d.get("risk"), dict):
+                merged.update(d["risk"])
+    except Exception:  # noqa: BLE001
+        return {}
+    return merged
+
+
+def _fallback_margin_line() -> float:
+    """Line for the inline fallback (margin_gate.py unloadable): never looser than the
+    config line (risk.buying_power_crit_usd from Trader's config.default.json overlaid by
+    accounts/<profile>/live_agents.json; the _MARGIN_GATE_LINE_USD constant when neither is
+    readable) nor than a VALID owner dashboard override (data/live/margin_gate_override.json,
+    >= the floor).  An override file that exists but is unreadable / below the floor falls
+    back to the last-good record (margin_gate_override.last_good.json) so a corrupt file
+    cannot loosen the gate.  No latch, no assignment reserve.  Never raises."""
+    merged = _fallback_config_risk()
+    cfg_line = _mg_pos(merged.get("buying_power_crit_usd"))
+    floor = _mg_pos(merged.get("margin_line_min_usd")) or _MARGIN_GATE_FLOOR_USD
+    line = cfg_line if cfg_line is not None else _MARGIN_GATE_LINE_USD
+    try:
+        live = _mg_live_dir()
+        ov_path = os.path.join(live, "margin_gate_override.json")
+        ov = None
+        if os.path.exists(ov_path):
+            d = _mg_read_json(ov_path)
+            v = _mg_pos(d.get("line_usd")) if isinstance(d, dict) else None
+            if v is not None and v >= floor:
+                ov = v
+            else:                                   # present but unusable: stay strict
+                lg = _mg_read_json(os.path.join(live, "margin_gate_override.last_good.json"))
+                v = _mg_pos(lg.get("line_usd")) if isinstance(lg, dict) else None
+                ov = v if (v is not None and v >= floor) else None
+        if ov is not None:
+            line = max(line, ov)
+    except Exception:  # noqa: BLE001
+        pass
+    return line
+
+
 def _inline_margin_gate(account, impact_usd, bp) -> dict:
-    """Fallback when margin_gate.py cannot be loaded: same line, no latch."""
-    line = _MARGIN_GATE_LINE_USD
+    """Fallback when margin_gate.py cannot be loaded: config line or owner override,
+    whichever is higher; no latch."""
+    line = _fallback_margin_line()
     if _norm_account(account) != _MARGIN_GATE_ACCOUNT:
         return {"state": "n/a", "blocked": False, "reason": "", "bp": None}
     b = _fnum(bp)
